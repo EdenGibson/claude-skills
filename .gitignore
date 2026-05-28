@@ -1,0 +1,16 @@
+# OS / editor crud
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Common build / dependency dirs (in case a skill ships with a tool)
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs and transient state
+*.log
+.cache/
