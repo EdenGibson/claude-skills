@@ -1,0 +1,116 @@
+#!/bin/bash
+source "$(dirname "$0")/_path.sh"
+INPUT=$(cat)
+
+# Parse top-level JSON field with node since jq may not be in PATH
+parse() {
+  echo "$INPUT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);process.stdout.write(String(j['$1']||''))}catch(e){}})"
+}
+
+# Parse nested JSON field (dot-separated path, two levels deep)
+parse2() {
+  echo "$INPUT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);const v=(j['$1']||{})['$2'];process.stdout.write(v!=null?String(v):'')}catch(e){}})"
+}
+
+CWD=$(parse cwd)
+SESSION_ID=$(parse session_id)
+TASK=$(cat "$HOME/.claude/session-titles/$SESSION_ID" 2>/dev/null)
+TRANSCRIPT=$(parse transcript_path)
+
+BASE="PS $(basename "$CWD")"
+
+# --- Git worktree segment ---
+# Prefer the workspace.git_worktree field supplied by Claude Code (present in linked worktrees)
+GIT_WORKTREE=$(parse2 workspace git_worktree)
+
+if [ -z "$GIT_WORKTREE" ]; then
+  # Fall back to the current branch name, running git in the session's cwd
+  GIT_WORKTREE=$(git -C "$CWD" branch --show-current 2>/dev/null)
+fi
+
+# --- Context meter ---
+# Bar + absolute token count of current context, scaled against compact-worthy
+# thresholds (not the full window — at 1M, percentages aren't useful):
+#   green  < 150k — clean
+#   yellow 150–300k — consider /compact
+#   red    >= 300k — /compact (quality starts degrading)
+# Bar fills proportionally to the red threshold (full bar = "compact now").
+# Tune via CLAUDE_CTX_YELLOW / CLAUDE_CTX_RED env vars.
+CTX_SEGMENT=""
+if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+  CTX_SEGMENT=$(TRANSCRIPT_PATH="$TRANSCRIPT" \
+    node -e '
+      (() => {
+        const fs = require("fs");
+        const path = process.env.TRANSCRIPT_PATH;
+        const yellow = parseInt(process.env.CLAUDE_CTX_YELLOW, 10) || 150000;
+        const red    = parseInt(process.env.CLAUDE_CTX_RED, 10)    || 300000;
+        let usage = null;
+        try {
+          const lines = fs.readFileSync(path, "utf8").trim().split("\n");
+          for (let i = lines.length - 1; i >= 0; i--) {
+            let m;
+            try { m = JSON.parse(lines[i]); } catch { continue; }
+            const u = m && m.message && m.message.usage;
+            if (u && (u.input_tokens != null || u.cache_read_input_tokens != null)) {
+              usage = u; break;
+            }
+          }
+        } catch { return; }
+        if (!usage) return;
+        const ctxTokens =
+          (usage.input_tokens || 0) +
+          (usage.cache_creation_input_tokens || 0) +
+          (usage.cache_read_input_tokens || 0);
+        const fillPct = Math.min(100, (ctxTokens / red) * 100);
+        const filled = Math.round(fillPct / 10);
+        const bar = "█".repeat(filled) + "░".repeat(10 - filled);
+        let color = "\x1b[32m";
+        if (ctxTokens >= red)         color = "\x1b[31m";
+        else if (ctxTokens >= yellow) color = "\x1b[33m";
+        const reset = "\x1b[0m";
+        const k = ctxTokens >= 10000 ? (ctxTokens/1000).toFixed(0) : (ctxTokens/1000).toFixed(1);
+        process.stdout.write(`${color}${bar} ${k}k${reset}`);
+      })();
+    ' 2>/dev/null)
+fi
+
+# --- Review tracker segment ---
+# Reads ~/.claude/skill-state/$SESSION_ID.json (written by review-track).
+# Renders e.g. "rev: CR 3/5 TN 1/3". Shown only if a review ran this session.
+REV_SEGMENT=""
+if [ -n "$SESSION_ID" ]; then
+  REV_SEGMENT=$(SESSION_ID="$SESSION_ID" node -e '
+    (() => {
+      const fs = require("fs"), os = require("os"), path = require("path");
+      const sid = process.env.SESSION_ID;
+      let st = {};
+      try {
+        st = JSON.parse(fs.readFileSync(
+          path.join(os.homedir(), ".claude", "skill-state", sid + ".json"), "utf8"));
+      } catch { return; }
+      const parts = [];
+      for (const [key, label] of [["cr", "CR"], ["tn", "TN"]]) {
+        const e = st[key];
+        if (!e || !e.ran) continue;
+        if (e.total > 0) {
+          const done = e.applied >= e.total;
+          const color = done ? "\x1b[32m" : "\x1b[33m";
+          parts.push(`${color}${label} ${e.applied}/${e.total}\x1b[0m`);
+        } else {
+          parts.push(`\x1b[32m${label} ✓\x1b[0m`);
+        }
+      }
+      if (parts.length) process.stdout.write("rev: " + parts.join(" "));
+    })();
+  ' 2>/dev/null)
+fi
+
+# Build the output line
+PARTS="$BASE"
+[ -n "$GIT_WORKTREE" ] && PARTS="$PARTS ($GIT_WORKTREE)"
+[ -n "$CTX_SEGMENT" ]  && PARTS="$PARTS | $CTX_SEGMENT"
+[ -n "$REV_SEGMENT" ]  && PARTS="$PARTS | $REV_SEGMENT"
+[ -n "$TASK" ]         && PARTS="$PARTS | $TASK"
+
+echo "$PARTS"

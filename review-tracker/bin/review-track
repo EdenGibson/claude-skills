@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const STATE_DIR = path.join(os.homedir(), '.claude', 'skill-state');
+const VALID_KEYS = new Set(['cr', 'tn']);
+const USAGE =
+  'usage: review-track <ran|review|fixed|reset|show> [cr|tn] [N] [--session ID]\n';
+
+function getSessionId(argv) {
+  const i = argv.indexOf('--session');
+  if (i !== -1 && argv[i + 1]) return argv[i + 1];
+  return process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || '';
+}
+function stateFile(sid) {
+  return path.join(STATE_DIR, `${sid}.json`);
+}
+function readState(sid) {
+  try { return JSON.parse(fs.readFileSync(stateFile(sid), 'utf8')); }
+  catch { return {}; }
+}
+function writeState(sid, state) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const file = stateFile(sid);
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(state));
+  fs.renameSync(tmp, file);
+}
+function ensureKey(state, key) {
+  if (!state[key]) state[key] = { ran: false, total: 0, applied: 0 };
+  return state[key];
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--session') { i++; continue; }
+    positional.push(argv[i]);
+  }
+  const [verb, key, n] = positional;
+  const sid = getSessionId(argv);
+
+  if (verb === 'show') {
+    process.stdout.write(sid ? JSON.stringify(readState(sid), null, 2) + '\n' : '{}\n');
+    return 0;
+  }
+  if (verb === 'reset') {
+    if (sid) { try { fs.unlinkSync(stateFile(sid)); } catch {} }
+    return 0;
+  }
+  if (!['ran', 'review', 'fixed'].includes(verb)) {
+    process.stderr.write(`review-track: unknown verb "${verb}"\n${USAGE}`);
+    return 2;
+  }
+  if (!VALID_KEYS.has(key)) {
+    process.stderr.write(`review-track: unknown key "${key}" (expected cr|tn)\n`);
+    return 2;
+  }
+  if (!sid) return 0;
+
+  const state = readState(sid);
+  const entry = ensureKey(state, key);
+
+  if (verb === 'ran') {
+    entry.ran = true;
+  } else if (verb === 'review') {
+    const total = parseInt(n, 10);
+    if (Number.isNaN(total) || total < 0) {
+      process.stderr.write('review-track: review requires a non-negative integer N\n');
+      return 2;
+    }
+    entry.ran = true;
+    entry.total = total;
+    entry.applied = 0;
+  } else if (verb === 'fixed') {
+    const k = n === undefined ? 1 : parseInt(n, 10);
+    if (Number.isNaN(k)) {
+      process.stderr.write('review-track: fixed requires an integer k\n');
+      return 2;
+    }
+    entry.ran = true;
+    entry.applied += k;
+    if (entry.total > 0 && entry.applied > entry.total) entry.applied = entry.total;
+    if (entry.applied < 0) entry.applied = 0;
+  }
+
+  writeState(sid, state);
+  return 0;
+}
+
+process.exit(main());

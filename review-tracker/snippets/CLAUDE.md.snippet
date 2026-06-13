@@ -1,0 +1,9 @@
+## Review tracking (statusline)
+
+A statusline segment shows two code reviews via `~/.claude/bin/review-track`:
+
+- **`/code-review` → `CR ✓`:** run-state only, set automatically by a hook when you run
+  `/code-review`. No action needed — do **not** record counts for it.
+- **thermo-nuclear → `TN a/b`:** the skill records its own finding count. When the user
+  prompts you to apply thermo-nuclear fixes, run `~/.claude/bin/review-track fixed tn`
+  once per fix you apply. (Best-effort; if missed the number is just stale, never wrong.)

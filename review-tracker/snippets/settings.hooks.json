@@ -1,0 +1,18 @@
+{
+  "_comment": "Documentation snippet — MERGE these into ~/.claude/settings.json. Do not overwrite the file. Add the statusLine block if absent, and add each hook OBJECT into the matching existing hooks array (UserPromptSubmit / PostToolUse / SessionStart). Adjust the absolute path if your home dir differs.",
+  "statusLine": {
+    "type": "command",
+    "command": "bash /home/eden/.claude/hooks/status-line.sh"
+  },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash /home/eden/.claude/hooks/prune-skill-state.sh" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash /home/eden/.claude/hooks/review-detect.sh" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Skill", "hooks": [ { "type": "command", "command": "bash /home/eden/.claude/hooks/review-detect.sh" } ] }
+    ]
+  }
+}
