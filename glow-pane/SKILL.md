@@ -1,6 +1,8 @@
 ---
 name: glow-pane
 description: Use when the user asks to view, preview, open, render, or "show me" a markdown file (plan, spec, findings doc, README, etc.) — opens it with glow in a new tmux split pane next to Claude Code so they can read it in-place without leaving the session. Triggers include "open that plan", "show me docs/X", "preview that", "view in glow", "pop it open", "render the markdown", "let me see it", "pull it up".
+model: haiku
+effort: low
 ---
 
 # glow-pane
@@ -34,6 +36,18 @@ Accepts multiple files — glow will page through them in order:
 
 Paths can be relative to cwd or absolute; the script calls `realpath` internally.
 
+## Theme awareness
+
+The pane is rendered with a `glow` style that matches the user's Claude Code theme, so a light-theme session gets light markdown and a dark-theme session gets dark — instead of glow's default `auto`, which can't sniff the background inside a headless tmux split and falls back to dark.
+
+Style is resolved in this order (most specific wins):
+
+1. **`GLOW_PANE_STYLE` env var** — explicit override; any glow style name or JSON path (`dark`, `light`, `dracula`, `auto`, `/path/to/style.json`). Set it to force a style regardless of theme.
+2. **Claude Code's `theme`** (read from `~/.claude/settings.json`, then `~/.claude.json`) — any `light*` theme → `light`, any `dark*` theme → `dark`.
+3. **`auto`** — if no theme is found, let glow sniff the terminal background.
+
+The chosen style is printed in the script's success line (`style: light`). No flags needed for the common case — just point it at a file and it follows the theme.
+
 ## Critical: don't read it back
 
 **After opening the pane, do NOT use the `Read` tool on that file.** The whole point is to keep the document out of Claude Code's context window — the user reads it with their eyes. Just confirm the pane opened and what file is in it.
@@ -57,6 +71,7 @@ Paths can be relative to cwd or absolute; the script calls `realpath` internally
 
 ## Notes on the tmux mechanics
 
+- Runs `glow -s <style> -p`, where `<style>` is resolved from the Claude Code theme (see **Theme awareness** above)
 - Uses `tmux split-window -h` (horizontal split = new pane on the right)
 - Auto-detects target session: uses `$TMUX` if Claude Code is inside tmux, otherwise picks the first session from `tmux list-sessions`
 - New pane's working directory is the file's parent dir, so if a shell drops out after glow exits the user lands somewhere useful

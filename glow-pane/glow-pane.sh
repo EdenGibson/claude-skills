@@ -12,6 +12,45 @@
 
 set -euo pipefail
 
+# Resolve the glow style so the rendered pane matches the user's Claude Code
+# theme instead of glow's default terminal-background sniffing (which can't
+# detect the background inside a headless tmux split and falls back to dark).
+#
+# Precedence (most specific wins):
+#   1. $GLOW_PANE_STYLE — explicit override; any glow style name or JSON path
+#      (e.g. dark, light, dracula, auto, /path/to/style.json).
+#   2. Claude Code's "theme" setting — light* themes -> light, dark* -> dark.
+#      Read from ~/.claude/settings.json, then ~/.claude.json as a fallback.
+#   3. "auto" — let glow sniff the terminal background.
+resolve_style() {
+  if [ -n "${GLOW_PANE_STYLE:-}" ]; then
+    printf '%s' "$GLOW_PANE_STYLE"
+    return
+  fi
+
+  local theme="" f
+  for f in "$HOME/.claude/settings.json" "$HOME/.claude.json"; do
+    [ -f "$f" ] || continue
+    # Prefer jq; fall back to a tolerant grep if jq is absent or the file
+    # isn't strict JSON for any reason.
+    if command -v jq >/dev/null 2>&1; then
+      theme="$(jq -r '.theme // empty' "$f" 2>/dev/null || true)"
+    fi
+    if [ -z "$theme" ]; then
+      theme="$(grep -o '"theme"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" 2>/dev/null \
+               | head -1 \
+               | sed -E 's/.*"theme"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
+    fi
+    [ -n "$theme" ] && break
+  done
+
+  case "$theme" in
+    *light*) printf 'light' ;;
+    *dark*)  printf 'dark'  ;;
+    *)       printf 'auto'  ;;
+  esac
+}
+
 if [ $# -lt 1 ]; then
   echo "usage: glow-pane <file> [<file> ...]" >&2
   exit 64
@@ -49,7 +88,10 @@ quoted=""
 for f in "${files[@]}"; do
   quoted+=" $(printf '%q' "$f")"
 done
-cmd="glow -p${quoted}"
+
+# Pick a style that matches the user's Claude Code theme (light/dark/auto).
+style="$(resolve_style)"
+cmd="glow -s $(printf '%q' "$style") -p${quoted}"
 
 # Compute a human-friendly title for the new pane:
 #   - one file  → its basename
@@ -76,6 +118,6 @@ tmux select-pane -t "$new_pane" -T "$pane_title"
 window_id="$(tmux display-message -p -t "$new_pane" '#{window_id}')"
 tmux set-option -w -t "$window_id" pane-border-status top
 
-echo "opened in tmux pane $new_pane (title: \"$pane_title\")"
+echo "opened in tmux pane $new_pane (title: \"$pane_title\", style: $style)"
 echo "files: ${files[*]}"
 echo "(press q to close the pane)"

@@ -2,6 +2,8 @@
 name: dev
 description: "Start the dev server (worktree-aware: assigns port based on worktree index)"
 user_invocable: true
+model: haiku
+effort: low
 ---
 
 # /dev — Start Dev Server

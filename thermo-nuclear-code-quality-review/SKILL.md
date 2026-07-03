@@ -1,7 +1,6 @@
 ---
 name: thermo-nuclear-code-quality-review
 description: Run an extremely strict maintainability review for abstraction quality, giant files, and spaghetti-condition growth. Use for a thermo-nuclear code quality review, thermonuclear review, deep code quality audit, or especially harsh maintainability review.
-disable-model-invocation: true
 ---
 
 # Thermo-Nuclear Code Quality Review
@@ -207,16 +206,3 @@ Treat these as presumptive blockers unless the author can justify them clearly:
 - the PR duplicates an existing helper or puts logic in the wrong layer when there is a clear canonical home
 
 If those conditions are not met, leave explicit, actionable feedback and push for a cleaner decomposition.
-
-## Statusline tracking (count only)
-
-After the review above is complete, record the finding count for the statusline tracker.
-Run exactly once:
-
-    ~/.claude/bin/review-track review tn <N>
-
-where `<N>` is the number of distinct findings you raised (use `0` if you raised none).
-This writes only a count to a small per-session file; it does **not** alter the free-prose
-review, which remains the deliverable, and it introduces **no** structured finding schema.
-If the user later asks you to apply fixes, run `~/.claude/bin/review-track fixed tn` once
-per finding you resolve.
