@@ -92,7 +92,10 @@ def gallery_page(directory):
         safe = html_mod.escape(name)
         cards.append(
             f'<a class="card" href="/{safe}">'
-            f'<div class="frame"><iframe src="/{safe}" loading="lazy" '
+            # ?embed=1 keeps the live-reload EventSource out of preview iframes:
+            # browsers cap ~6 connections per origin, so with many designs the
+            # iframes' SSE streams would exhaust the pool and clicks would hang.
+            f'<div class="frame"><iframe src="/{safe}?embed=1" loading="lazy" '
             f'tabindex="-1" scrolling="no"></iframe></div>'
             f'<span class="name">{safe}</span></a>'
         )
@@ -144,11 +147,12 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body_bytes)
 
     def do_GET(self):
-        if self.path.split("?")[0] == "/__livereload":
+        path, _, query = self.path.partition("?")
+        if path == "/__livereload":
             return self._serve_sse()
+        embed = "embed=1" in query
 
         root = self.directory
-        path = self.path.split("?")[0]
 
         if path == "/":
             files = design_files(root)
@@ -159,17 +163,17 @@ class Handler(SimpleHTTPRequestHandler):
         # Map URL path to a file; inject into .html, otherwise serve normally.
         local = self.translate_path(self.path)
         if local.lower().endswith(".html") and os.path.isfile(local):
-            return self._serve_injected_html(local)
+            return self._serve_injected_html(local, live=not embed)
         return super().do_GET()
 
-    def _serve_injected_html(self, local_path):
+    def _serve_injected_html(self, local_path, live=True):
         try:
             with open(local_path, "rb") as f:
                 raw = f.read()
         except OSError:
             self.send_error(404)
             return
-        self._send_html(inject(raw))
+        self._send_html(inject(raw) if live else raw)
 
     def _serve_sse(self):
         self.send_response(200)
