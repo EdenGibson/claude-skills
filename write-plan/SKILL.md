@@ -55,7 +55,9 @@ Use when the work is **already settled** in this session and you just need to ca
 
 ## Plan format
 
-**REQUIRED REFERENCE:** read the canonical template before writing — `~/.claude/skills/improve/references/plan-template.md` (the exact format `plan-executor` consumes; don't invent another).
+**REQUIRED REFERENCE:** read this skill's template before writing — `~/.claude/skills/write-plan/references/plan-template.md`. It is the format `plan-executor` consumes; don't invent another.
+
+> **Why this skill owns its own template.** It was forked from `improve`'s on 2026-07-31 so changes here don't silently alter every plan `improve` writes. The two are near-identical by design and **the executor-facing contract must stay in sync**: the `> Executor instructions` + drift-check block, the `## Status` field set (`plan-executor` orders work by Priority/Effort/Depends-on), the `proof:*` tags on Done criteria, the `evidence: motion` marker, and the `plans/README.md` row format. Diff against `~/.claude/skills/improve/references/plan-template.md` before changing any of those; everything else is this skill's to tune.
 
 Three properties make a plan executable by a weaker, zero-context model — all three are mandatory:
 
