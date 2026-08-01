@@ -1,0 +1,375 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * plan-number — collision-proof plan numbering for repos with a plans/NNN-slug.md convention.
+ *
+ * Why this exists: numbering by hand collides. Reading origin/main and taking max+1 is
+ * necessary but not sufficient — nothing stops a rival session from claiming that number
+ * between the moment you pick it and the moment you push. The only fix is to re-check and
+ * renumber *at push time*, which is what `ship` does.
+ *
+ *   plan-number next            -> next free NNN across origin/main, every fetched ref, and
+ *                                  untracked local plans (the ghosts a dirty checkout leaves)
+ *   plan-number ghosts          -> untracked local plans whose slug already landed upstream
+ *                                  under a different number (stale pre-renumber copies)
+ *   plan-number ship <file>     -> claim-at-push: fetch, renumber if the number was taken,
+ *                                  commit ONLY the plan + plans/README.md, push to main.
+ *                                  Runs in a throwaway worktree, so a dirty checkout is
+ *                                  never touched, never stashed, never rebased.
+ */
+
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const PLAN_RE = /^(\d{3,})-(.+)\.md$/;
+
+function git(cwd, ...args) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function gitQuiet(cwd, ...args) {
+  try {
+    return { ok: true, out: git(cwd, ...args) };
+  } catch (e) {
+    return { ok: false, out: String((e.stderr || '') + (e.stdout || '')).trim() };
+  }
+}
+
+function die(msg) {
+  process.stderr.write(`plan-number: ${msg}\n`);
+  process.exit(1);
+}
+
+function repoRoot() {
+  try {
+    return git(process.cwd(), 'rev-parse', '--show-toplevel');
+  } catch {
+    die('not inside a git repository');
+  }
+}
+
+/** Remote default branch, e.g. "main". */
+function mainBranch(root) {
+  const r = gitQuiet(root, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD');
+  if (r.ok && r.out) return r.out.replace(/^origin\//, '');
+  for (const b of ['main', 'master']) {
+    if (gitQuiet(root, 'rev-parse', '--verify', `refs/remotes/origin/${b}`).ok) return b;
+  }
+  return 'main';
+}
+
+function fetch(root) {
+  const r = gitQuiet(root, 'fetch', 'origin', '--quiet', '--prune');
+  if (!r.ok) process.stderr.write(`plan-number: warning: git fetch failed (offline?)\n`);
+}
+
+function parsePlan(basename) {
+  const m = PLAN_RE.exec(basename);
+  return m ? { num: parseInt(m[1], 10), slug: m[2] } : null;
+}
+
+/** Plan files on a given ref, as basenames. */
+function planesOnRef(root, ref) {
+  const r = gitQuiet(root, 'ls-tree', '-r', '--name-only', ref, '--', 'plans/');
+  if (!r.ok) return [];
+  return r.out.split('\n').filter(Boolean).map((p) => path.basename(p));
+}
+
+/** Every plan number ever created on any fetched ref, plus every one on disk right now. */
+function usedNumbers(root) {
+  const nums = new Set();
+  const add = (basename) => {
+    const p = parsePlan(basename);
+    if (p) nums.add(p.num);
+  };
+
+  // Any ref (main, other branches, tags, remote-tracking) — includes plans that were later
+  // renamed away, so a retired number is never silently recycled.
+  const log = gitQuiet(
+    root,
+    'log', '--all', '--diff-filter=A', '--pretty=format:', '--name-only', '--', 'plans/',
+  );
+  if (log.ok) log.out.split('\n').filter(Boolean).forEach((p) => add(path.basename(p)));
+
+  // The dirty checkout: untracked or uncommitted plans still hold their number.
+  const dir = path.join(root, 'plans');
+  if (fs.existsSync(dir)) fs.readdirSync(dir).forEach(add);
+
+  return nums;
+}
+
+/**
+ * Next free number: start just above the head of origin/main's sequence, then walk up to
+ * the first number nothing anywhere is using.
+ *
+ * Deliberately NOT max+1 over every number seen. Repos accumulate far-off reserved bands
+ * (Derive carries plans/900-rehearsal.md, 901-added.md, 902-x.md from a loop rehearsal);
+ * max+1 would hand out 903 and abandon the real 3xx sequence permanently. Anchoring to
+ * origin/main keeps the sequence honest, and the upward walk still refuses every number
+ * held by a branch, a retired rename, or an untracked local file.
+ */
+const OUTLIER_GAP = 100;
+
+/** Head of the real sequence: the top of origin/main, minus any isolated reserved band. */
+function sequenceHead(root) {
+  const sorted = [
+    ...new Set(
+      planesOnRef(root, `origin/${mainBranch(root)}`).map(parsePlan).filter(Boolean).map((p) => p.num),
+    ),
+  ].sort((a, b) => a - b);
+  let cut = sorted.length;
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] - sorted[i - 1] > OUTLIER_GAP) { cut = i; break; }
+  }
+  const seq = sorted.slice(0, cut);
+  return seq.length ? seq[seq.length - 1] : 0;
+}
+
+function nextFree(root, used = usedNumbers(root)) {
+  let n = sequenceHead(root) + 1;
+  while (used.has(n)) n++;
+  return String(n).padStart(3, '0');
+}
+
+/** Untracked local plans whose slug already exists upstream under a different number. */
+function findGhosts(root) {
+  const main = mainBranch(root);
+  const upstream = planesOnRef(root, `origin/${main}`)
+    .map(parsePlan)
+    .filter(Boolean);
+  const status = gitQuiet(root, 'status', '--porcelain', '--', 'plans/');
+  if (!status.ok) return [];
+  const ghosts = [];
+  for (const line of status.out.split('\n').filter((l) => l.startsWith('??'))) {
+    const rel = line.slice(3).trim();
+    const local = parsePlan(path.basename(rel));
+    if (!local) continue;
+    const match = upstream.find((u) => u.slug === local.slug && u.num !== local.num);
+    if (match) ghosts.push({ local: rel, upstream: `plans/${String(match.num).padStart(3, '0')}-${match.slug}.md` });
+  }
+  return ghosts;
+}
+
+// ---------------------------------------------------------------- README rows
+
+const SEPARATOR_RE = /^\s*\|[\s|:-]+\|\s*$/;
+
+function firstCell(line) {
+  const t = line.trim();
+  if (!t.startsWith('|')) return null;
+  return t.slice(1).split('|')[0].trim();
+}
+
+/**
+ * A plan row is identified by its FIRST CELL being a plan number — `| 348 | …` or
+ * `| [348](348-slug.md) | …`. Do not identify it by hunting for an `NNN-slug.md` link
+ * anywhere in the line: Derive's real README uses bare numbers and carries 371 table rows
+ * across several unrelated tables, so a loose match finds no plan rows and appends the new
+ * row to the rejected-findings table at the bottom of the file.
+ */
+function rowNumber(line) {
+  const cell = firstCell(line);
+  if (cell === null) return null;
+  const m = /^\[?(\d{3,})\]?(\([^)]*\))?$/.exec(cell);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function isPlanRow(line) {
+  return rowNumber(line) !== null;
+}
+
+/**
+ * Drop rows matching `isOurs`, then insert `row` in plan-number order.
+ * `isOurs` must match OUR row only — never "any row with our old number". When we renumber
+ * because a rival took that number, the row still sitting at it is the rival's, and
+ * deleting it silently drops their plan from the index.
+ */
+function spliceRow(readme, row, num, isOurs) {
+  let lines = readme.split('\n');
+  if (isOurs) lines = lines.filter((l) => !isOurs(l));
+
+  let insertAt = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const n = rowNumber(lines[i]);
+    if (n === null) continue;
+    if (n > num) { insertAt = i; break; }
+    insertAt = i + 1;
+  }
+  if (insertAt === -1) {
+    // No plan rows yet: sit right after the FIRST header separator, which is the plans
+    // table. Never the last one — that belongs to some other table further down.
+    const sep = lines.findIndex((l) => SEPARATOR_RE.test(l));
+    insertAt = sep === -1 ? lines.length : sep + 1;
+  }
+  lines.splice(insertAt, 0, row);
+  return lines.join('\n').replace(/\n*$/, '\n');
+}
+
+/** Synthesize a row matching the plans table's column count (fallback only). */
+function synthRow(readme, num, title) {
+  const lines = readme.split('\n');
+  const sep = lines.find((l) => SEPARATOR_RE.test(l));
+  const cols = sep ? sep.trim().split('|').filter((c) => c.trim() !== '').length : 3;
+  const cells = [String(num), title];
+  while (cells.length < cols - 1) cells.push('—');
+  if (cols >= 3) cells.push('TODO');
+  return `| ${cells.join(' | ')} |`;
+}
+
+function renumberText(text, oldNum, newNum, slug) {
+  return text
+    .split(`${oldNum}-${slug}.md`).join(`${newNum}-${slug}.md`)
+    .split(`[${oldNum}]`).join(`[${newNum}]`)
+    .replace(new RegExp(`^(#\\s*Plan\\s*)${oldNum}\\b`, 'gmi'), `$1${newNum}`)
+    .replace(new RegExp(`^(\\|\\s*)${oldNum}(\\s*\\|)`, 'gm'), `$1${newNum}$2`);
+}
+
+function planTitle(body, slug) {
+  const m = /^#\s*Plan\s*\d+\s*:\s*(.+)$/m.exec(body);
+  return m ? m[1].trim() : slug.replace(/-/g, ' ');
+}
+
+// ------------------------------------------------------------------ commands
+
+function cmdNext() {
+  const root = repoRoot();
+  fetch(root);
+  process.stdout.write(nextFree(root) + '\n');
+}
+
+function cmdGhosts() {
+  const root = repoRoot();
+  fetch(root);
+  const ghosts = findGhosts(root);
+  if (!ghosts.length) {
+    process.stdout.write('no ghost plans: every untracked plan slug is new to origin\n');
+    return;
+  }
+  process.stdout.write(
+    `${ghosts.length} ghost plan(s) — already landed upstream under a different number.\n` +
+      `These poison numbering and duplicate checks. Delete the local copy after confirming.\n\n`,
+  );
+  for (const g of ghosts) process.stdout.write(`  ${g.local}\n    already on origin as ${g.upstream}\n`);
+}
+
+function cmdShip(fileArg) {
+  if (!fileArg) die('usage: plan-number ship <plans/NNN-slug.md>');
+  const root = repoRoot();
+  const abs = path.resolve(fileArg);
+  if (!fs.existsSync(abs)) die(`no such plan file: ${fileArg}`);
+
+  const parsed = parsePlan(path.basename(abs));
+  if (!parsed) die(`not a plan filename (expected NNN-slug.md): ${path.basename(abs)}`);
+
+  const slug = parsed.slug;
+  const oldNum = String(parsed.num).padStart(3, '0');
+  const oldFile = `${oldNum}-${slug}.md`;
+  const body = fs.readFileSync(abs, 'utf8');
+  const main = mainBranch(root);
+
+  // Reuse the row the author already wrote locally (it matches this repo's README format);
+  // synthesize one only if it is missing.
+  const localReadmePath = path.join(root, 'plans', 'README.md');
+  const localReadme = fs.existsSync(localReadmePath) ? fs.readFileSync(localReadmePath, 'utf8') : '';
+  const authoredRow = localReadme.split('\n').find((l) => rowNumber(l) === parsed.num);
+
+  let shipped = null;
+  let renumbered = false;
+
+  for (let attempt = 1; attempt <= 3 && !shipped; attempt++) {
+    fetch(root);
+    const upstream = planesOnRef(root, `origin/${main}`).map(parsePlan).filter(Boolean);
+
+    if (upstream.some((u) => u.num === parsed.num && u.slug === slug)) {
+      process.stdout.write(`already on origin/${main} as plans/${oldFile} — nothing to ship.\n`);
+      fs.unlinkSync(abs);
+      process.stdout.write(`removed the local duplicate so it cannot become a ghost.\n`);
+      return;
+    }
+
+    const taken = upstream.some((u) => u.num === parsed.num);
+    const num = taken ? nextFree(root) : oldNum;
+    if (taken) renumbered = true;
+    const newFile = `${num}-${slug}.md`;
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-ship-'));
+    const wt = path.join(tmp, 'wt');
+    const added = gitQuiet(root, 'worktree', 'add', '--detach', wt, `origin/${main}`);
+    if (!added.ok) die(`could not create throwaway worktree: ${added.out}`);
+
+    try {
+      fs.mkdirSync(path.join(wt, 'plans'), { recursive: true });
+      fs.writeFileSync(
+        path.join(wt, 'plans', newFile),
+        num === oldNum ? body : renumberText(body, oldNum, num, slug),
+      );
+
+      const readmePath = path.join(wt, 'plans', 'README.md');
+      const base = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, 'utf8') : '# Plans\n';
+      const row = authoredRow
+        ? renumberText(authoredRow, oldNum, num, slug)
+        : synthRow(base, num, planTitle(body, slug));
+      const isOurs = (l) =>
+        rowNumber(l) === parsed.num && (l === authoredRow || l.includes(oldFile));
+      fs.writeFileSync(readmePath, spliceRow(base, row, parseInt(num, 10), isOurs));
+
+      // The standing grant is exactly this plan + its README row. Stage nothing else.
+      git(wt, 'add', '--', `plans/${newFile}`, 'plans/README.md');
+      git(wt, 'commit', '-m', `plan(${num}): ${planTitle(body, slug)}`);
+
+      const pushed = gitQuiet(wt, 'push', 'origin', `HEAD:${main}`);
+      if (pushed.ok) {
+        shipped = { num, newFile, sha: git(wt, 'rev-parse', '--short', 'HEAD') };
+      } else if (attempt === 3) {
+        die(`push rejected after 3 attempts: ${pushed.out}`);
+      } else {
+        process.stderr.write(`plan-number: push rejected, refetching and retrying\n`);
+      }
+    } finally {
+      gitQuiet(root, 'worktree', 'remove', '--force', wt);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  // Clear the local copy: it is on origin now, and a lingering untracked copy is exactly
+  // how stale ghosts (and the next collision) are born.
+  fs.unlinkSync(abs);
+  if (authoredRow) {
+    fs.writeFileSync(
+      localReadmePath,
+      localReadme.split('\n').filter((l) => l !== authoredRow).join('\n'),
+    );
+  }
+
+  if (renumbered) {
+    process.stdout.write(
+      `renumbered ${oldNum} -> ${shipped.num}: plans/${oldFile} was claimed on origin/${main} ` +
+        `after this plan was written.\n`,
+    );
+  }
+  process.stdout.write(
+    `shipped plans/${shipped.newFile} to origin/${main} (${shipped.sha}).\n` +
+      `local copy removed; run 'git pull' to get the landed version.\n`,
+  );
+}
+
+const [cmd, arg] = process.argv.slice(2);
+switch (cmd) {
+  case 'next': cmdNext(); break;
+  case 'ghosts': cmdGhosts(); break;
+  case 'ship': cmdShip(arg); break;
+  default:
+    process.stderr.write(
+      'usage: plan-number <next|ghosts|ship <file>>\n' +
+        '  next          next free plan number (origin + all refs + untracked local)\n' +
+        '  ghosts        untracked local plans that already landed upstream\n' +
+        '  ship <file>   renumber-if-taken, then commit+push the plan and its README row\n',
+    );
+    process.exit(cmd ? 1 : 0);
+}
