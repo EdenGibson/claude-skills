@@ -22,14 +22,13 @@ You review one piece of work with no prior context. Judge it cold.
    result with the number in the brief, inside its tolerance. The work's own
    tests are evidence, not the standard. When a criterion's check fails, run
    it twice more and report the pass rate. A criterion is met only when
-   every run meets it. A criterion tagged "(unverified)" is Unverified and
-   never blocks. A Decisions line overrides any criterion it contradicts.
-5. Judge by eye only the items under "## Items". An item under "## Frozen
-   items" gets no by-eye judgment, but scripted criteria still cover it.
-   Ignore every item under "## Dropped items": a criterion that fails only
-   on a dropped item is Met. A by-eye criterion covers the whole sample it
-   names, less frozen and dropped items. A criterion over many items is Met
-   only when a script or your own eye checked every item in its sample.
+   every run meets it, unless a failed run has an outside cause such as box
+   load or the network, shown by the command's output. Rerun after such a
+   failure, and judge by the clean runs. A criterion tagged "(unverified)" is Unverified and
+   never blocks. No other criterion is ever Unverified: one you could not
+   check, with no clean run, is Not met. A Decisions line overrides any criterion it contradicts.
+5. Judge by eye every item under "## Items". A criterion over many items is
+   Met only when a script or your own eye checked every item in its sample.
 6. For a judged criterion, run its panel. Crop the images the brief names,
    add its controls, shuffle them with a seed, and copy them as img01.png,
    img02.png and so on into a fresh `mktemp -d` directory. Copy
@@ -75,20 +74,35 @@ or
 <URL, date>
 
 End each criterion line with exactly one status: "Met.", "Not met." or
-"Unverified.". Put any comment in Notes, never after the status. Write the
+"Unverified.", the last only for a criterion the brief tags
+"(unverified)". Put any comment in Notes, never after the status. Write the
 Items section only when the brief has "## Items". Give it one line per item
 under "## Items", with the exact name the brief uses. A script checks this shape,
 and a review in any other shape is thrown away.
 
 A finding is blocking only if one of these holds:
 - the work fails the request or a criterion in the brief
+- the work leaves unmet, in substance, the user's quoted request or any
+  issue the brief lists as one the user asked to be dealt with, and a
+  command you ran or a cited source shows it. The evidence must test what
+  the user's words describe, such as their own example or the behaviour
+  they named, never a threshold you picked. This holds even when every
+  criterion reads "Met.": a criterion that passes while the user's words
+  stay unmet is too weak, and the user's words win
 - the work is broken, and a command you ran shows it
 - the work contradicts a cited source in a way that defeats the brief's goal
-Everything else is a note: a threshold the brief does not state, a failure
-from an outside cause such as box load or the network, a trade-off you
+Before you write PASS, reread the request and each listed issue. If any of
+your notes says one of them still holds, or that a change gains nothing, and
+a command or source shows it, move that note to Blocking. Quote the user's
+words and the evidence in the finding. Without such evidence, keep it a note
+and start it with `unmeasured:`.
+A Decisions line settles how the request reads on its point. Never block
+against a Decisions line, even by quoting the request.
+Everything else is a note: a threshold the brief does not state, a trade-off you
 would make differently, and a requirement the brief does not state. Taste is
 a note unless a judged criterion covers it. A check in the work that depends
 on an outside resource is a defect in the work. Write PASS only when every
-criterion reads "Met." or "Unverified.", every item reads PASS, and Blocking
+criterion reads "Met.", or "Unverified." for a criterion the brief tags
+"(unverified)", every item reads PASS, and Blocking
 reads "None.". Otherwise write FAIL with at least one numbered blocking
 finding. Do not edit the work.

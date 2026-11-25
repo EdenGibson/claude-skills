@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Install Playwright browsers on an ascii.dev box, so they survive a snapshot.
+# Install Playwright browsers on a Boat sandbox (boat.dev, formerly ascii.dev
+# Box), so they survive a snapshot.
 #
-#   box new --setup-file ~/.claude/skills/box/assets/setup-playwright.sh
-#   box scp setup-playwright.sh <id>:/home/user/ && box ssh <id> 'bash ~/setup-playwright.sh'
+#   boat new --setup-file ~/.claude/skills/boat/assets/setup-playwright.sh
+#   boat scp setup-playwright.sh <id>:/home/user/ && boat ssh <id> 'bash ~/setup-playwright.sh'
 #
 # Idempotent. A second run with the same version and browser set exits early.
 #
@@ -18,10 +19,10 @@
 # So browsers go in ~/.playwright, and three mechanisms point Playwright there:
 #
 #   1. /etc/environment sets PLAYWRIGHT_BROWSERS_PATH. pam_env reads it for
-#      every PAM session, so `box ssh` gets the variable. profile.d does not
-#      reach `box ssh`, which runs no login shell.
+#      every PAM session, so `boat ssh` gets the variable. profile.d does not
+#      reach `boat ssh`, which runs no login shell.
 #   2. /etc/profile.d/playwright.sh exports the same variable for login shells.
-#      `box exec` already arrives with it set this way.
+#      `boat exec` already arrives with it set this way.
 #   3. playwright-browsers.service re-links ~/.cache/ms-playwright at boot, so
 #      the default path works even with no variable at all.
 #

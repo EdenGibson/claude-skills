@@ -352,6 +352,25 @@ def main():
         check("__katex" in embedded, "embedded (gallery iframe) math still renders")
         check("EventSource" not in embedded, "embedded math page opens no SSE stream")
 
+        # 4b. Static files must be revalidated. With only Last-Modified, Chrome
+        #     caches a file for 10% of its age, so a script untouched for 4 days
+        #     stays cached ~10 hours. A reload then pairs new html with old
+        #     modules, and the page breaks with no visible cause.
+        os.makedirs(os.path.join(tmp, "src"), exist_ok=True)
+        with open(os.path.join(tmp, "src", "app.js"), "w") as f:
+            f.write("export const v = 1;\n")
+        st, hdr, _ = get_raw("/src/app.js")
+        check(st == 200 and hdr.get("Cache-Control") == "no-cache",
+              f"static js is sent with Cache-Control: no-cache (got {hdr.get('Cache-Control')})")
+        req = urllib.request.Request(BASE + "/src/app.js",
+                                     headers={"If-Modified-Since": hdr.get("Last-Modified")})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                revalidated = r.status
+        except urllib.error.HTTPError as e:
+            revalidated = e.code
+        check(revalidated == 304, f"an unchanged file revalidates as 304 (got {revalidated})")
+
         # 5. Byte ranges. Without them a <video> cannot seek: Chrome asks for a
         #    range, gets the whole file back, and the scrub bar does nothing --
         #    you can only watch forward at 1x as the file downloads.

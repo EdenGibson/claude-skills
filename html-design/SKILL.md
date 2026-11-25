@@ -1,6 +1,6 @@
 ---
 name: html-design
-description: THE way to show Eden any HTML/CSS you are writing — a live-reloading design server at http://devbox:4321 that auto-refreshes his laptop on every edit, with LaTeX/KaTeX rendering built in. Use whenever you author or iterate on a web page, UI, component, layout, or visual variant — "design a landing page", "mock up a pricing page", "make me a hero section", "iterate on this layout", "show me a design", "/html-design ...". Also use it instead of the `preview` command (devbox:4340) for any HTML you are still editing: `preview` is a static URL Eden must refresh by hand, and is only for finished artifacts like charts, reports, or a built site directory. Never publish `~/design-lab/` through `preview`.
+description: "THE way to show Eden any HTML/CSS you are writing — a live-reloading design server at http://devbox:4321 that auto-refreshes his laptop on every edit, with LaTeX/KaTeX rendering built in. Use whenever you author or iterate on a web page, UI, component, layout, or visual variant — \"design a landing page\", \"mock up a pricing page\", \"make me a hero section\", \"iterate on this layout\", \"show me a design\", \"/html-design ...\". Also use it instead of the `preview` command (devbox:4340) for any HTML you are still editing: `preview` is a static URL Eden must refresh by hand, and is only for finished artifacts like charts, reports, or a built site directory. Never publish `~/design-lab/` through `preview`."
 user_invocable: true
 ---
 

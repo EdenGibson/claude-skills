@@ -20,6 +20,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import gzip
 import html as html_mod
 import json
 import urllib.parse
@@ -56,6 +57,12 @@ except Exception:  # pragma: no cover - a broken chart.py must cost only charts
             return ""
 
     chart = _NoCharts()
+
+# Favicons, so a tab strip full of devbox servers stays readable. One folder
+# for every server on this box, written by ~/.local/bin/make-server-icons.py.
+# A missing folder costs the icon and nothing else.
+ICON_DIR = os.path.expanduser("~/.local/share/server-icons")
+ICON_TYPES = {".ico": "image/x-icon", ".png": "image/png"}
 
 KATEX_DIR = os.path.join(HERE, "vendor", "katex")
 KATEX_VERSION = "0.16.45"  # matches vendor/katex/VERSION.txt
@@ -162,6 +169,45 @@ def _content_only(html_text):
     return _NON_CONTENT.sub(" ", html_text)
 
 
+# wants_katex can only ever say yes through _OPT_IN or _MATH_MARKERS, and each
+# of those needs one of these literals present. A page holding none of them is
+# a no without any regex being run at all.
+#
+# The regexes cost 83ms on a 1 MB worklog page, paid on every request because
+# composition has no cache. _SELF_MANAGED alone was 58ms: its four branches
+# retry at every offset across a megabyte of markup that holds no math.
+_MATH_LITERALS = (
+    "data-latex",                                    # _OPT_IN, _DOLLAR_MODE
+    "$$", "\\(", "\\[", "\\begin{", "\\ce", "\\pu",  # _MATH_MARKERS
+)
+
+
+def _may_want_katex(html_text):
+    """Cheap superset of wants_katex(): False means the regexes cannot match."""
+    low = html_text.lower()
+    return any(lit in low for lit in _MATH_LITERALS)
+
+
+# Every branch of _SELF_MANAGED begins with one of these, so the pattern can
+# only match where one of them sits. str.find gets to each candidate in C;
+# running the alternation itself across a megabyte took 58ms, because it
+# retries four branches at every offset. A page that merely says the word
+# "KaTeX" in prose, which a design-QA worklog does, pays that on every load.
+_SELF_MANAGED_HINTS = ("katex", "mathjax", "rendermathinelement")
+_SELF_MANAGED_WINDOW = 40  # longest branch is renderMathInElement, 19 chars
+
+
+def _self_managed(html_text, low=None):
+    low = html_text.lower() if low is None else low
+    for hint in _SELF_MANAGED_HINTS:
+        at = low.find(hint)
+        while at != -1:
+            if _SELF_MANAGED.search(html_text, at, at + _SELF_MANAGED_WINDOW):
+                return True
+            at = low.find(hint, at + 1)
+    return False
+
+
 def wants_katex(html_text):
     """True if this page should get KaTeX wired up.
 
@@ -171,9 +217,12 @@ def wants_katex(html_text):
 
     Everything but the opt-out/self-managed checks looks at markup only —
     `data-latex` built inside a template literal is code, not a request."""
-    if _OPT_OUT.search(html_text):
+    low = html_text.lower()
+    if not any(lit in low for lit in _MATH_LITERALS):
         return False
-    if _SELF_MANAGED.search(html_text):
+    if "data-latex" in low and _OPT_OUT.search(html_text):
+        return False
+    if _self_managed(html_text, low):
         return False
     body = _content_only(html_text)
     if _OPT_IN.search(body):
@@ -403,6 +452,7 @@ def gallery_page(directory):
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Design lab</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
   :root {{ color-scheme: dark; }}
   body {{ margin:0; font:15px/1.5 system-ui,sans-serif; background:#0f1115; color:#e7e9ee; }}
@@ -549,12 +599,25 @@ def worklog_signature(directory, slug=None):
         slug = worklog_slug(slug)
         candidate = os.path.join(directory, slug or "")
         if slug and os.path.isdir(candidate):
-            # A task page must notice a new chart under assets/, so walk it all.
+            # Everything the page reads is stat'd per file: meta.json, log.html
+            # and charts/, which is where the live charts live.
+            #
+            # assets/ is stat'd per *directory* instead. It holds screenshots,
+            # and a task that has run all day holds thousands of them: walking
+            # every file cost 25-38ms here against a 0.3s poll, so one open tab
+            # burned a tenth of a core forever. A directory mtime still moves
+            # when a file is added, renamed or deleted, which is how an asset
+            # arrives. Overwriting an existing asset in place is the one edit
+            # this misses, and the log append that shows it moves log.html.
+            assets = os.path.join(candidate, "assets")
             sig = []
             for dirpath, dirnames, filenames in os.walk(candidate):
                 dirnames.sort()
-                for name in sorted(filenames):
-                    p = os.path.join(dirpath, name)
+                in_assets = (dirpath == assets or
+                             dirpath.startswith(assets + os.sep))
+                names = [""] if in_assets else sorted(filenames)
+                for name in names:
+                    p = os.path.join(dirpath, name) if name else dirpath
                     try:
                         st = os.stat(p)
                     except OSError:
@@ -655,6 +718,7 @@ def worklog_board(directory):
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Worklog</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
 {WORKLOG_CSS}
 </style></head>
@@ -712,6 +776,169 @@ document.querySelectorAll('time.wl-when[datetime]').forEach(function (el) {
 """.strip()
 
 
+# --- Worklog images: lazy, and sized before they load ---------------------
+#
+# A long audit page carries a hundred screenshots. Served as written, every one
+# of them downloads the moment the page opens, because a bare <img> is eager.
+# Measured on design-qa-sep: 103 images, 10.4 MB, all fetched at open, on a
+# page the browser reloads after every append.
+#
+# Lazy alone is not enough. An <img> with no intrinsic size lays out 0px tall,
+# so the whole list sits inside the viewport and the browser loads it anyway.
+# The width/height pair is what gives each one a box, so only the handful Eden
+# can actually see get fetched. Dimensions come from the file header on disk,
+# so a fragment written months ago gets them without being rewritten.
+
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*?/?>", re.IGNORECASE)
+_IMG_SRC_RE = re.compile(r"""\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""",
+                         re.IGNORECASE)
+
+
+def _has_attr(tag, name):
+    return re.search(r"\b%s\s*=" % name, tag, re.IGNORECASE) is not None
+
+
+def _png_size(head):
+    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return None
+    return (int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big"))
+
+
+def _gif_size(head):
+    if head[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    return (int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little"))
+
+
+def _webp_size(head):
+    if head[:4] != b"RIFF" or head[8:12] != b"WEBP":
+        return None
+    chunk = head[12:16]
+    if chunk == b"VP8X":
+        # 24-bit little-endian, stored as value-1.
+        return (int.from_bytes(head[24:27], "little") + 1,
+                int.from_bytes(head[27:30], "little") + 1)
+    if chunk == b"VP8 ":
+        return (int.from_bytes(head[26:28], "little") & 0x3FFF,
+                int.from_bytes(head[28:30], "little") & 0x3FFF)
+    if chunk == b"VP8L" and head[20:21] == b"\x2f":
+        bits = int.from_bytes(head[21:25], "little")
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    return None
+
+
+# SOF0-3, 5-7, 9-11, 13-15 carry the frame dimensions. DHT, DAC and SOS do not.
+_JPEG_SOF = frozenset((0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                       0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF))
+
+
+def _jpeg_size(fh):
+    """Walk JPEG segments to the frame header. Needs the file, not just a head:
+    a photo's EXIF thumbnail can push the frame header past any fixed prefix."""
+    fh.seek(2)
+    while True:
+        byte = fh.read(1)
+        if not byte:
+            return None
+        if byte != b"\xff":
+            continue                       # resync on the next marker
+        marker = fh.read(1)
+        while marker == b"\xff":           # fill bytes before a marker
+            marker = fh.read(1)
+        if not marker:
+            return None
+        m = marker[0]
+        if m in (0x00, 0x01, 0xD8, 0xD9) or 0xD0 <= m <= 0xD7:
+            continue                       # standalone: carries no length
+        raw = fh.read(2)
+        if len(raw) < 2:
+            return None
+        length = int.from_bytes(raw, "big")
+        if length < 2:
+            return None
+        if m in _JPEG_SOF:
+            body = fh.read(5)              # precision, height, width
+            if len(body) < 5:
+                return None
+            return (int.from_bytes(body[3:5], "big"),
+                    int.from_bytes(body[1:3], "big"))
+        if m == 0xDA:                      # start of scan: entropy data, stop
+            return None
+        fh.seek(length - 2, 1)
+
+
+_SIZE_CACHE = {}
+_SIZE_CACHE_MAX = 4096
+
+
+def image_size(path):
+    """(width, height) of an image on disk, or None if it cannot be read.
+
+    Cached on (path, mtime_ns, size), so composing a page costs one dict hit
+    per image after the first request and a rewritten file re-reads itself.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key in _SIZE_CACHE:
+        return _SIZE_CACHE[key]
+    size = None
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(32)
+            size = _png_size(head) or _gif_size(head) or _webp_size(head)
+            if size is None and head[:2] == b"\xff\xd8":
+                size = _jpeg_size(fh)
+    except OSError:
+        size = None
+    if size and not (0 < size[0] <= 100000 and 0 < size[1] <= 100000):
+        size = None
+    if len(_SIZE_CACHE) >= _SIZE_CACHE_MAX:
+        _SIZE_CACHE.clear()
+    _SIZE_CACHE[key] = size
+    return size
+
+
+def worklog_prepare_images(log, task_dir):
+    """Make every <img> in the log lazy, async-decoded and intrinsically sized.
+
+    Attributes the fragment already set are left alone, so an agent that sizes
+    its own image, or sets loading="eager" for something it wants up front,
+    keeps what it wrote. Only task-relative sources are measured: an absolute
+    URL has no file to stat, and a traversing one must not be opened at all.
+    """
+    if "<img" not in log.lower():
+        return log
+    task_dir = os.path.abspath(task_dir)
+
+    def fix(m):
+        tag = m.group(0)
+        add = []
+        if not _has_attr(tag, "loading"):
+            add.append('loading="lazy"')
+        if not _has_attr(tag, "decoding"):
+            add.append('decoding="async"')
+        if not (_has_attr(tag, "width") or _has_attr(tag, "height")):
+            sm = _IMG_SRC_RE.search(tag)
+            src = (sm.group(1) or sm.group(2) or sm.group(3)) if sm else ""
+            size = None
+            if src and "//" not in src and not src.startswith(("data:", "/")):
+                rel = urllib.parse.unquote(src.split("?", 1)[0].split("#", 1)[0])
+                local = os.path.normpath(os.path.join(task_dir, rel))
+                if local.startswith(task_dir + os.sep):
+                    size = image_size(local)
+            if size:
+                add.append('width="%d" height="%d"' % size)
+        if not add:
+            return tag
+        body = tag[:-2] if tag.endswith("/>") else tag[:-1]
+        return body.rstrip() + " " + " ".join(add) + ">"
+
+    return _IMG_TAG_RE.sub(fix, log)
+
+
 def worklog_page(directory, slug):
     """Compose one task page: shell + meta header + every appended fragment.
 
@@ -744,6 +971,7 @@ def worklog_page(directory, slug):
         log = '<p class="empty">Nothing appended yet.</p>'
     else:
         log = worklog_newest_first(log)
+        log = worklog_prepare_images(log, task_dir)
 
     # Charts are pinned above the log, never inside it. The log is append-only
     # and reads newest first, so a chart appended into it would scroll away
@@ -761,6 +989,7 @@ def worklog_page(directory, slug):
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} · Worklog</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
 {WORKLOG_CSS}
 </style></head>
@@ -776,6 +1005,35 @@ def worklog_page(directory, slug):
 </main>
 {WORKLOG_TIME_SCRIPT}
 </body></html>"""
+
+
+# One composed, injected task page per (slug, embed), kept only while the task
+# tree is unchanged. Composition still has no time-based cache: the key is the
+# same signature the live-reload stream watches, so an appended fragment
+# invalidates the entry in the act of being appended, and the very next reload
+# rebuilds. What this removes is the rebuild Eden pays for *re*-opening a page
+# nothing has written to, which on a megabyte of log cost ~130ms of markup
+# regex per request.
+_DOC_CACHE = {}
+_DOC_CACHE_MAX = 32
+
+
+def worklog_document(directory, slug, embed=False):
+    """Final bytes for one task page, or None when the task does not exist."""
+    sig = worklog_signature(directory, slug=slug)
+    key = (directory, slug, bool(embed))
+    hit = _DOC_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    page = worklog_page(directory, slug)
+    if page is None:
+        _DOC_CACHE.pop(key, None)
+        return None
+    body = inject(page.encode("utf-8"), live=not embed, page=slug)
+    if len(_DOC_CACHE) >= _DOC_CACHE_MAX:
+        _DOC_CACHE.clear()
+    _DOC_CACHE[key] = (sig, body)
+    return body
 
 
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
@@ -820,6 +1078,17 @@ class Handler(SimpleHTTPRequestHandler):
     mode = "design"  # "design" | "worklog"; bound per-server in make_handler
     _advertise_ranges = False
 
+    # HTTP/1.0 closes the socket after every response, so a page carrying a
+    # hundred screenshots paid a hundred TCP handshakes, six at a time, over a
+    # tailnet hop. 1.1 reuses the connection. Every response this server sends
+    # already carries a Content-Length; the one that cannot, the SSE stream,
+    # marks itself `Connection: close` below.
+    protocol_version = "HTTP/1.1"
+    # An idle kept-alive connection otherwise parks a thread on readline until
+    # the browser feels like closing it. socketserver turns this into a socket
+    # timeout, and handle_one_request drops the connection when it fires.
+    timeout = 30
+
     def log_message(self, *args):
         pass  # quiet
 
@@ -829,18 +1098,64 @@ class Handler(SimpleHTTPRequestHandler):
         super().send_response(code, message)
 
     def end_headers(self):
-        if self._advertise_ranges and getattr(self, "_status", None) == 200:
-            self.send_header("Accept-Ranges", "bytes")
+        if self._advertise_ranges and getattr(self, "_status", None) in (200, 304):
+            if self._status == 200:
+                self.send_header("Accept-Ranges", "bytes")
+            # Last-Modified alone lets Chrome cache a file for 10% of its age,
+            # so a reload paired new html with hours-old modules. no-cache
+            # makes every load revalidate, and an unchanged file costs a 304.
+            self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
+    # Below this, the header costs more than the compression saves.
+    _GZIP_MIN = 1400
+
     def _send_html(self, body_bytes, status=200):
+        # A long worklog page is a megabyte of repeated markup and compresses
+        # about 3x (measured: 1000 KB -> 340 KB on design-qa-sep). The page
+        # reloads on every append, so that ride is paid over and over.
+        encoding = None
+        if (len(body_bytes) >= self._GZIP_MIN
+                and "gzip" in self.headers.get("Accept-Encoding", "").lower()):
+            try:
+                body_bytes = gzip.compress(body_bytes, 6)
+                encoding = "gzip"
+            except Exception:
+                encoding = None
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            # Same URL, two bodies. Without this a shared cache could hand the
+            # gzipped bytes to a client that never asked for them.
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body_bytes)))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body_bytes)
+
+    def _serve_icon(self, suffix):
+        """Serve this server's favicon: `design` on 4321, `worklog` on 4370.
+
+        /favicon.ico is here for the design files themselves. Those are Eden's
+        own mockups, this server never edits their <head>, and a browser asks
+        the origin root for /favicon.ico when a page declares no icon.
+        """
+        name = "worklog" if self.mode == "worklog" else "design"
+        stem = f"{name}.ico" if suffix == ".ico" else f"{name}-32.png"
+        try:
+            with open(os.path.join(ICON_DIR, stem), "rb") as fh:
+                blob = fh.read()
+        except OSError:
+            return self.send_error(404, "no icon")
+        self.send_response(200)
+        self.send_header("Content-Type", ICON_TYPES[suffix])
+        self.send_header("Cache-Control", "max-age=86400")
+        self.send_header("Content-Length", str(len(blob)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(blob)
 
     def _send_worklog_board(self):
         """Serve the board through inject(), never _send_html directly.
@@ -884,6 +1199,8 @@ class Handler(SimpleHTTPRequestHandler):
                 urllib.parse.parse_qs(query).get("page", [None])[0])
         if path.startswith(KATEX_ROUTE + "/"):
             return self._serve_vendor(path[len(KATEX_ROUTE) + 1:])
+        if path in ("/favicon.ico", "/favicon.png"):
+            return self._serve_icon(os.path.splitext(path)[1])
         embed = "embed=1" in query
         watched = urllib.parse.parse_qs(query).get("page", [None])[0]
 
@@ -968,6 +1285,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.send_header("Last-Modified",
                          self.date_time_string(os.path.getmtime(local)))
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         if self.command == "HEAD":
             return
@@ -983,7 +1301,9 @@ class Handler(SimpleHTTPRequestHandler):
                     left -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             # Every seek cancels the range still in flight. That is normal
-            # player behaviour, not a fault worth a traceback.
+            # player behaviour, not a fault worth a traceback. The connection
+            # is short of its Content-Length now, so it cannot be reused.
+            self.close_connection = True
             return
 
     def _serve_injected_html(self, local_path, live=True, page=None):
@@ -1014,23 +1334,28 @@ class Handler(SimpleHTTPRequestHandler):
         if len(parts) == 1:
             if not path.endswith("/"):
                 if not os.path.isdir(os.path.join(self.directory, slug)):
-                    # Most no-trailing-slash hits here are /favicon.ico, which
-                    # is never a task directory. Redirecting it anyway cost two
-                    # round trips (a 301 that itself 404s) on every board load.
+                    # A no-trailing-slash hit that names no task directory is a
+                    # stray asset request, never a task. Redirecting it anyway
+                    # cost two round trips (a 301 that itself 404s) on every
+                    # board load. /favicon.ico used to be the common case and
+                    # now answers earlier, in _serve_icon.
                     self.send_error(404)
                     return
                 # Redirect so relative asset URLs inside a fragment resolve
                 # against /<slug>/ rather than against the root.
                 self.send_response(301)
                 self.send_header("Location", "/" + urllib.parse.quote(slug) + "/")
+                # Explicit, because HTTP/1.1 keeps the connection open: a
+                # bodiless response with no length leaves the browser waiting
+                # for framing that never arrives.
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            page = worklog_page(self.directory, slug)
-            if page is None:
+            body = worklog_document(self.directory, slug, embed=embed)
+            if body is None:
                 self.send_error(404)
                 return
-            return self._send_html(
-                inject(page.encode("utf-8"), live=not embed, page=slug))
+            return self._send_html(body)
         # Anything deeper is an asset, served by translate_path. That drops
         # `..` components, so this asset leg alone cannot climb out of
         # self.directory. It says nothing about the slug leg above, which
@@ -1070,10 +1395,14 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
 
     def _serve_sse(self, page=None):
+        # The one response with no Content-Length and no end. Under HTTP/1.1 a
+        # client would otherwise wait for chunked framing that never comes, so
+        # this stream declares itself the last thing on its connection.
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
         last = self._signature(only=page)
         ticks = 0

@@ -1,0 +1,57 @@
+# attn.service — the list of things only Eden can do (tailnet only).
+#
+#   open:    http://devbox:4380
+#   watch:   journalctl --user -u attn.service -f
+#   stop:    systemctl --user stop attn
+#   remove:  systemctl --user disable --now attn.service \
+#              && rm ~/.config/systemd/user/attn.service
+#
+# WARNING: this service runs agent-authored shell every 2 minutes, as Eden.
+# Each open item's --alive command is executed by the check loop. Agents
+# already have Bash, so this grants no new capability; it grants persistence,
+# because a command filed once keeps running after the session that wrote it
+# ends. `attn purge` drops every open item and stops every check at once.
+#
+# Environment=PATH is not decoration, and carries two separate jobs:
+#   * attn_server.bind_host() runs `tailscale ip -4`. Under a minimal systemd
+#     PATH that lookup raises OSError, the bind falls back to 127.0.0.1, and
+#     the service comes up healthy but invisible from Eden's laptop.
+#   * Every item check inherits this environment. A check that works in Eden's
+#     shell and fails here is the most likely early bug, which is why the page
+#     shows last_error rather than hiding it.
+#
+# The PATH below was verified against the binaries checks actually need.
+# Measured 2026-08-07: gh, git, tailscale and python3 are all in /usr/bin.
+# `node` must come from the fnm node-versions path named here, NOT from the
+# ambient one — an interactive shell resolves node through
+# /run/user/1000/fnm_multishells/<pid>_<stamp>/bin, which is per-shell and
+# will not exist for this service. `pnpm` is a shell function interactively
+# but a real binary at /usr/bin/pnpm, so it works here; a check that relied on
+# the interactive wrapper's behaviour would not.
+#
+# Enable with:  systemctl --user daemon-reload && systemctl --user enable --now attn
+[Unit]
+Description=attn — items needing Eden (tailnet only)
+# Both lines are advisory only: this is a --user unit, and neither
+# network-online.target nor tailscaled.service exists in the user manager.
+# ExecStartPre below is what actually holds the guarantee.
+After=network-online.target tailscaled.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.local/share/fnm/node-versions/v24.15.0/installation/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=%h/.claude/skills/attn
+# Refuse to start until `tailscale ip -4` answers — the exact call bind_host()
+# makes. Failing here is correct: Restart=always plus RestartSec=5 retries
+# until the tailnet is up, which is far better than serving on 127.0.0.1 and
+# reporting success.
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do tailscale ip -4 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "tailscale ip -4 never answered; refusing to bind 127.0.0.1" >&2; exit 1'
+ExecStart=/usr/bin/python3 %h/.claude/skills/attn/attn_server.py 4380
+Restart=always
+RestartSec=5
+SyslogIdentifier=attn
+Nice=10
+
+[Install]
+WantedBy=default.target

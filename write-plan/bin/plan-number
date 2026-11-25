@@ -16,6 +16,28 @@
  *                                  commit ONLY the plan + plans/README.md, push to main.
  *                                  Runs in a throwaway worktree, so a dirty checkout is
  *                                  never touched, never stashed, never rebased.
+ *   plan-number research <file> -> classify the plan's ## Research section as
+ *                                  cited | declared | empty | missing, and warn loudly on the
+ *                                  last two. `ship` runs the same check before pushing.
+ *   plan-number issue <file>    -> dry run of the issue label flip below: which issue, under
+ *                                  which key, and what `ship` will do to it. Read-only.
+ *
+ * Why the research check is WARN-ONLY (Eden, 2026-08-01): research is the most-skipped step in
+ * the skill and nothing checked it, so a skip was invisible. But the plan-executor loops ship
+ * plans unattended — a hard gate would strand them mid-automation. So this makes a skip *loud*
+ * rather than *impossible*, and never changes the exit code.
+ *
+ * Issue label flip (Eden, 2026-09-06). After a successful push, a plan that cites a GitHub
+ * issue in THIS repo — front matter `closes_issue:` / `issue:`, or the `- **Issue**:` bullet in
+ * ## Status — marks that issue as spoken for: add `planned`, remove `needs-triage`, and leave a
+ * comment carrying `<!-- plan: NNN -->`. A bullet with no front-matter key gets `issue:` written
+ * in (the safe default: related, no closing keyword; only `closes_issue:` makes the executor emit
+ * `Closes #N`). Why here: no loop holds label authority, and the one skill that did (issue-work)
+ * was removed 2026-08-03 because a per-issue verb could not keep up. Every plan passes through
+ * `ship`, in the author's own session, so this is the one place the flip can live. Warn-only —
+ * the plan is already on origin/main when it runs, and a label failure must not read as a
+ * failed ship. Measured before this landed: 176 of 177 open from-feedback issues carried
+ * `needs-triage`, including 12 with a plan already on main and 9 whose fix had merged.
  */
 
 const { execFileSync } = require('child_process');
@@ -41,9 +63,25 @@ function gitQuiet(cwd, ...args) {
   }
 }
 
+function gh(cwd, ...args) {
+  return execFileSync('gh', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
 function die(msg) {
   process.stderr.write(`plan-number: ${msg}\n`);
   process.exit(1);
+}
+
+function warn(msg) {
+  process.stderr.write(`  ⚠  ${msg}\n`);
+}
+
+function firstLine(e) {
+  return String((e && (e.stderr || e.message)) || e).split('\n').find(Boolean) || 'unknown error';
 }
 
 function repoRoot() {
@@ -230,9 +268,306 @@ function renumberText(text, oldNum, newNum, slug) {
     .replace(new RegExp(`^(\\|\\s*)${oldNum}(\\s*\\|)`, 'gm'), `$1${newNum}$2`);
 }
 
+const FRONT_MATTER_RE = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;
+const PLAN_FIELD_RE = /^(plan:[ \t]*)(["']?)0*(\d+)\2([ \t]*)$/m;
+
+/**
+ * Force the front-matter `plan:` field to agree with the number this plan is shipping at.
+ *
+ * `pnpm plans:index` reads THIS field and nothing else to number a row — the filename and the
+ * `# Plan NNN` heading are decoration to it. Plan 423 was renumbered to 428 and shipped with
+ * `plan: "423"` still in its front matter, so the generated index carried two rows numbered 423
+ * and none for 428: the plan was invisible to the executor while looking perfectly correct in
+ * `ls`. It was the only such mismatch across 420 plans, i.e. specific to this renumber path.
+ *
+ * Deliberately unconditional rather than an oldNum -> newNum swap. A field that disagreed with
+ * the filename for any other reason is the same silent row loss, and would otherwise ship stale.
+ * The filename is the plan's identity; this makes the field match it.
+ *
+ * Scoped by index to the front-matter block: a global replace of the number would rewrite
+ * counts, line numbers and prose in the body.
+ */
+function reconcilePlanNumber(text, num) {
+  const fm = FRONT_MATTER_RE.exec(text);
+  if (!fm) return { text, corrected: null };
+
+  let corrected = null;
+  const rewritten = fm[0].replace(PLAN_FIELD_RE, (line, head, quote, was, tail) => {
+    if (parseInt(was, 10) === parseInt(num, 10)) return line;
+    corrected = was;
+    return `${head}${quote}${num}${quote}${tail}`;
+  });
+  return { text: rewritten + text.slice(fm[0].length), corrected };
+}
+
 function planTitle(body, slug) {
   const m = /^#\s*Plan\s*\d+\s*:\s*(.+)$/m.exec(body);
   return m ? m[1].trim() : slug.replace(/-/g, ' ');
+}
+
+// ---------------------------------------------------------- issue label flip
+
+/**
+ * The plan's issue reference, raw. Front matter wins (`closes_issue:` over `issue:`, so a plan
+ * that carries both is read as fully resolving); the `- **Issue**:` bullet is the fallback the
+ * older plans and the template already use. `key` is null when only the bullet named it.
+ */
+function issueCandidate(text) {
+  const fm = FRONT_MATTER_RE.exec(text);
+  if (fm) {
+    for (const key of ['closes_issue', 'issue']) {
+      const m = new RegExp(`^${key}:[ \\t]*(["']?)(.*?)\\1[ \\t]*$`, 'm').exec(fm[0]);
+      if (m && m[2].trim()) return { key, raw: m[2].trim(), source: `${key}:` };
+    }
+  }
+  const body = stripFences(text);
+  const bullet = /^\s*-\s*\*\*Issue\*\*\s*:\s*(.+)$/m.exec(body);
+  if (bullet) return { key: null, raw: bullet[1].trim(), source: 'the Issue bullet' };
+  // Last resort: the State bullet's provenance prose. Plans 551 and 577 named their issue only
+  // there ("authored 2026-09-02 ..., from GitHub issue #2269"). The phrase is explicit enough
+  // to trust; a bare "#N" elsewhere is not, since PR numbers share the space.
+  const state = /^\s*-\s*\*\*State\*\*\s*:\s*(.+)$/m.exec(body);
+  if (state) {
+    const m = /\b(?:from|for)\s+(?:GitHub\s+|feedback\s+|the\s+)?issue\s+#(\d+)\b/i.exec(state[1]);
+    if (m) return { key: null, raw: `#${m[1]}`, source: 'the State bullet' };
+  }
+  return null;
+}
+
+/** The template's "no issue" placeholder, or nothing at all. */
+function isIssuePlaceholder(raw) {
+  return !raw || /^[—–-]+$/.test(raw) || /^none$/i.test(raw);
+}
+
+/**
+ * A number ONLY when `raw` unambiguously names an issue in `repo`. Accepts a bare number, an
+ * issue URL in this repo, "`owner/repo` #N" (plan 547's form), or a leading "#N". A URL or
+ * owner/repo pair pointing anywhere else is `outside` — plan 246 cites mozilla/pdf.js#20899,
+ * and a bare number lifted from that would label whatever Derive issue shares it. A PR URL is
+ * `outside` too: issue and PR numbers share one space.
+ */
+function issueRef(raw, repo) {
+  const s = String(raw || '').trim();
+  if (/^\d+$/.test(s)) return { num: s };
+  const esc = repo.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  let m = new RegExp(`^https?://github\\.com/${esc}/issues/(\\d+)(?=$|[\\s#?/)])`, 'i').exec(s);
+  if (m) return { num: m[1] };
+  m = new RegExp(`^\`?${esc}\`?\\s*#(\\d+)\\b`, 'i').exec(s);
+  if (m) return { num: m[1] };
+  m = /^#(\d+)\b/.exec(s);
+  if (m) return { num: m[1] };
+  if (/github\.com\/[^/\s]+\/[^/\s]+\/(issues|pull)\/\d+/i.test(s) || /^`?[\w.-]+\/[\w.-]+`?\s*#\d+/.test(s)) {
+    return { num: null, reason: 'outside' };
+  }
+  return { num: null, reason: 'unparsed' };
+}
+
+/**
+ * Write `closes_issue: "N"` or `issue: "N"` into the front matter. `key` is never guessed here:
+ * ship refuses to run without one, because a default is what kept `closes_issue:` at 0 plans.
+ */
+function addIssueKey(text, num, key) {
+  const fm = FRONT_MATTER_RE.exec(text);
+  if (!fm) return { text, added: false };
+  const block = fm[0];
+  const closing = /\r?\n---[ \t]*(?:\r?\n|$)$/.exec(block);
+  if (!closing) return { text, added: false };
+  const rewritten = block.slice(0, closing.index) + `\n${key}: "${num}"` + block.slice(closing.index);
+  return { text: rewritten + text.slice(block.length), added: true };
+}
+
+/** Title and first few lines of the report, for the refusal message. Null when `gh` cannot read it. */
+function issueSummary(root, repo, num) {
+  try {
+    const issue = JSON.parse(gh(root, 'api', `repos/${repo}/issues/${num}`));
+    const lines = String(issue.body || '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    return { title: String(issue.title || '').trim(), lines };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The refusal. Printed with the report in it, because the author holds the context now and will
+ * not after the plan lands. Measured 2026-09-12: `closes_issue:` appeared in 0 of 672 plans and
+ * `issue:` in 5, so ship's own safe default decided every case and no merged fix ever closed its
+ * issue. 153 `needs-triage` issues were open at a median age of 35 days.
+ */
+function chooseKeyMessage(root, repo, num, planFile, summary) {
+  const quoted = summary
+    ? [`  #${num} ${summary.title}`, ...summary.lines.map((l) => `  ${l}`)].join('\n')
+    : `  #${num} (could not read the issue; check it on GitHub before you choose)`;
+  return (
+    `plans/${planFile} names issue #${num}, but nothing says what the plan does to it.\n\n` +
+    `${quoted}\n` +
+    `  https://github.com/${repo}/issues/${num}\n\n` +
+    `Ship again with one of:\n` +
+    `  --closes    this plan fully resolves #${num}. The executor writes 'Closes #${num}' into the PR,\n` +
+    `              so merging the fix closes the issue.\n` +
+    `  --related   this plan touches #${num} but leaves work behind. The issue stays open.\n\n` +
+    `No default, on purpose: ship used to pick 'related' by itself, and 0 of 672 plans supplied\n` +
+    `the executor with a closing keyword.`
+  );
+}
+
+/** The repo `gh` resolves origin to, e.g. "Derive-Notes/Derive"; null when it cannot. */
+function githubRepo(root) {
+  try {
+    const slug = gh(root, 'repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner');
+    return /^[\w.-]+\/[\w.-]+$/.test(slug) ? slug : null;
+  } catch {
+    return null;
+  }
+}
+
+function planComment({ repo, main, planNum, planFile, key }) {
+  const link = `[plans/${planFile}](https://github.com/${repo}/blob/${main}/plans/${planFile})`;
+  const tail =
+    key === 'closes_issue'
+      ? 'The PR that ships it will close this issue on merge.'
+      : 'Related work: this plan does not fully resolve the report, so the issue stays open after the fix merges.';
+  return `Planned as ${link}, queued for the plan-executor. ${tail}\n\n<!-- plan: ${planNum} -->\n`;
+}
+
+/**
+ * Mark the issue as spoken for. Idempotent: labels already right and marker already posted
+ * mean zero writes. Every failure is a warning — the plan is on origin/main by now.
+ */
+function flipIssueLabels(root, { repo, num, key, main, planNum, planFile }) {
+  const where = `#${num} in ${repo}`;
+  try {
+    const issue = JSON.parse(gh(root, 'api', `repos/${repo}/issues/${num}`));
+    if (issue.pull_request) {
+      warn(`${where} is a pull request, not an issue; skipped the label flip.`);
+      return;
+    }
+    if (issue.state !== 'open') {
+      warn(`${where} is already closed; skipped the label flip.`);
+      return;
+    }
+    const labels = new Set((issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name)));
+    const edit = [];
+    if (!labels.has('planned')) edit.push('--add-label', 'planned');
+    if (labels.has('needs-triage')) edit.push('--remove-label', 'needs-triage');
+
+    const marker = `<!-- plan: ${planNum} -->`;
+    const comments = JSON.parse(gh(root, 'api', `repos/${repo}/issues/${num}/comments?per_page=100`));
+    const commented = (Array.isArray(comments) ? comments : []).some((c) => String(c.body || '').includes(marker));
+
+    const did = [];
+    if (edit.length) {
+      gh(root, 'issue', 'edit', num, '--repo', repo, ...edit);
+      if (!labels.has('planned')) did.push('added planned');
+      if (labels.has('needs-triage')) did.push('removed needs-triage');
+    }
+    if (!commented) {
+      gh(root, 'issue', 'comment', num, '--repo', repo, '--body', planComment({ repo, main, planNum, planFile, key }));
+      did.push(`commented with ${marker}`);
+    }
+    process.stdout.write(
+      `issue #${num} (${repo}): ${did.length ? did.join(', ') : 'already marked planned and commented'}.\n`,
+    );
+  } catch (e) {
+    warn(`issue label flip failed for ${where}: ${firstLine(e)} (warn only; the plan is on origin/${main}).`);
+  }
+}
+
+// ------------------------------------------------------------- research check
+
+/** Drop fenced code blocks so a `## Research` heading quoted in a template doesn't count. */
+function stripFences(text) {
+  return text.replace(/^[ \t]*(```|~~~)[\s\S]*?^[ \t]*\1[ \t]*$/gm, '');
+}
+
+/**
+ * Classify a plan's ## Research section.
+ *   cited    — >=1 URL: the plan rests on sources the executor can follow
+ *   declared — the literal "No external surface — <reason>" opt-out, on the record
+ *   empty    — section exists but says nothing checkable
+ *   missing  — no section at all
+ * `empty` and `missing` are the same failure (the research step was skipped); they are
+ * reported separately only because the fix differs.
+ */
+function classifyResearch(text) {
+  const body = stripFences(text);
+  const lines = body.split('\n');
+  const start = lines.findIndex((l) => /^#{2,}\s+Research\b/i.test(l));
+  if (start === -1) return { verdict: 'missing', citations: 0 };
+
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((l) => /^#{2,}\s+\S/.test(l));
+  const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
+
+  const citations = (section.match(/https?:\/\/\S+/g) || []).length;
+  // The dispatch guarantees an explicit CURRENT/SUPERSEDED/DEPRECATED/INSECURE verdict. We can't
+  // verify a subagent ran — observed agents research inline instead — but we can check the field.
+  const hasVerdict = /approach verdict/i.test(section);
+  if (citations > 0) return { verdict: 'cited', citations, hasVerdict };
+  // Accept em dash, en dash, or hyphen — authors and models are inconsistent about it.
+  if (/^\s*(?:[-*]\s*)?No external surface\s*(?:[—–]|-{1,2})\s*\S/im.test(section)) {
+    return { verdict: 'declared', citations: 0, hasVerdict: true };
+  }
+  return { verdict: 'empty', citations: 0, hasVerdict: false };
+}
+
+const RESEARCH_HINT =
+  `  Fix: add >=1 citation (URL + version/date checked) under '## Research', or the literal line\n` +
+  `       No external surface — <reason>\n` +
+  `  A cited current source beats recollection ~9 times out of 10. Your weights are a lead;\n` +
+  `  a source you actually opened is a fact. Silence here reads as 'none needed' — it isn't.\n`;
+
+/** Loud stderr banner for a skipped research step. Never changes the exit code. */
+function warnResearch(verdict, label, hasVerdict = true) {
+  if (verdict === 'cited' || verdict === 'declared') {
+    // Cited, but the approach was never explicitly validated — the half of step 4 that catches
+    // "the decided fix doesn't actually work", which is where its measured value came from.
+    if (verdict === 'cited' && !hasVerdict) {
+      process.stderr.write(
+        `\n  ⚠  NO APPROACH VERDICT — ${label} cites sources but never states whether the decided\n` +
+          `     approach is still CURRENT / SUPERSEDED / DEPRECATED / INSECURE.\n` +
+          `  Fix: add a line to '## Research':\n` +
+          `       **Approach verdict**: CURRENT — <one sentence + the URL that establishes it>\n` +
+          `  Citing sources proves you looked. The verdict is what makes you check the decision\n` +
+          `  you are about to hand a zero-context executor.\n` +
+          `  (warn only — not blocking. Report this warning to the user verbatim.)\n\n`,
+      );
+      return true;
+    }
+    return false;
+  }
+  const what =
+    verdict === 'missing'
+      ? `${label} has NO '## Research' section`
+      : `${label} has a '## Research' section with no citation and no opt-out line`;
+  process.stderr.write(
+    `\n  ⚠  RESEARCH MISSING — ${what}.\n` +
+      RESEARCH_HINT +
+      `  (warn only — not blocking. Report this warning to the user verbatim.)\n\n`,
+  );
+  return true;
+}
+
+function cmdResearch(fileArg) {
+  if (!fileArg) die('usage: plan-number research <plans/NNN-slug.md>');
+  const abs = path.resolve(fileArg);
+  if (!fs.existsSync(abs)) die(`no such plan file: ${fileArg}`);
+  const label = `plans/${path.basename(abs)}`;
+  const { verdict, citations, hasVerdict } = classifyResearch(fs.readFileSync(abs, 'utf8'));
+
+  const summary = {
+    cited:
+      `cited: ${citations} citation${citations === 1 ? '' : 's'} in ## Research` +
+      (hasVerdict ? '' : ' (no Approach verdict)'),
+    declared: `declared: 'No external surface' opt-out is on the record`,
+    empty: `empty: ## Research section present but nothing checkable in it`,
+    missing: `missing: no ## Research section`,
+  }[verdict];
+  process.stdout.write(summary + '\n');
+  warnResearch(verdict, label, hasVerdict);
 }
 
 // ------------------------------------------------------------------ commands
@@ -241,6 +576,48 @@ function cmdNext() {
   const root = repoRoot();
   fetch(root);
   process.stdout.write(nextFree(root) + '\n');
+}
+
+/** Dry run of the ship-time flip: which issue, under which key, and whether ship would default `issue:`. */
+function cmdIssue(fileArg) {
+  if (!fileArg) die('usage: plan-number issue <plans/NNN-slug.md>');
+  const abs = path.resolve(fileArg);
+  if (!fs.existsSync(abs)) die(`no such plan file: ${fileArg}`);
+  const root = repoRoot();
+  const candidate = issueCandidate(fs.readFileSync(abs, 'utf8'));
+  if (!candidate || isIssuePlaceholder(candidate.raw)) {
+    process.stdout.write('none: no closes_issue:/issue: front matter and no Issue bullet — ship will not touch any issue\n');
+    return;
+  }
+  const repo = githubRepo(root);
+  if (!repo) {
+    process.stdout.write(`unresolved: '${candidate.raw}' — gh cannot resolve origin to a GitHub repo, so ship will skip the flip\n`);
+    return;
+  }
+  const ref = issueRef(candidate.raw, repo);
+  if (!ref.num) {
+    process.stdout.write(
+      ref.reason === 'outside'
+        ? `outside: '${candidate.raw}' is not an issue in ${repo} — ship will ignore it\n`
+        : `unparsed: '${candidate.raw}' — ship will skip the flip\n`,
+    );
+    return;
+  }
+  if (!candidate.key) {
+    process.stdout.write(
+      `no key: #${ref.num} in ${repo} (from ${candidate.source}).\n` +
+        `  ship will refuse until you pass a key:\n` +
+        `    --closes    this plan fully resolves #${ref.num}; the executor emits Closes #${ref.num}\n` +
+        `    --related   this plan leaves #${ref.num} open\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `${candidate.key}: #${ref.num} in ${repo}` +
+      ` — ship will add planned, remove needs-triage, and comment` +
+      (candidate.key === 'closes_issue' ? '; the executor will emit Closes #' + ref.num : '; no closing keyword') +
+      '\n',
+  );
 }
 
 function cmdGhosts() {
@@ -258,8 +635,9 @@ function cmdGhosts() {
   for (const g of ghosts) process.stdout.write(`  ${g.local}\n    already on origin as ${g.upstream}\n`);
 }
 
-function cmdShip(fileArg) {
-  if (!fileArg) die('usage: plan-number ship <plans/NNN-slug.md>');
+function cmdShip(fileArg, opts = {}) {
+  if (!fileArg) die('usage: plan-number ship <plans/NNN-slug.md> [--closes|--related]');
+  if (opts.closes && opts.related) die('--closes and --related contradict each other; pass one.');
   const root = repoRoot();
   const abs = path.resolve(fileArg);
   if (!fs.existsSync(abs)) die(`no such plan file: ${fileArg}`);
@@ -270,8 +648,71 @@ function cmdShip(fileArg) {
   const slug = parsed.slug;
   const oldNum = String(parsed.num).padStart(3, '0');
   const oldFile = `${oldNum}-${slug}.md`;
-  const body = fs.readFileSync(abs, 'utf8');
+  let body = fs.readFileSync(abs, 'utf8');
   const main = mainBranch(root);
+
+  // Warn-only research check. Deliberately fires BEFORE the push (so it is visible while the
+  // plan can still be fixed) and is repeated after (so it survives the success message).
+  const research = classifyResearch(body);
+  const researchVerdict = research.verdict;
+  const researchWarned = warnResearch(researchVerdict, `plans/${oldFile}`, research.hasVerdict);
+
+  // Resolve the issue this plan speaks for, BEFORE the push: a bullet-only reference gets a key
+  // written into the front matter so the executor and the index see one key, not prose. Which
+  // key is the author's call and ship blocks until it has one, because the executor emits
+  // `Closes #N` for `closes_issue:` and nothing at all for `issue:`. The flip itself runs after
+  // the push (see the end of this function). `gh` is only consulted when the plan actually names
+  // something — a plan with no issue costs no network.
+  let issueFlip = null;
+  let issueKeyAdded = null;
+  const candidate = issueCandidate(body);
+  const named = candidate && !isIssuePlaceholder(candidate.raw);
+  const chosen = opts.closes ? 'closes_issue' : opts.related ? 'issue' : null;
+  if (!named && chosen) {
+    die(
+      `--${opts.closes ? 'closes' : 'related'} was passed, but plans/${oldFile} names no issue.\n` +
+        `Add the issue to the Status block first, or drop the flag.`,
+    );
+  }
+  if (named) {
+    const repo = githubRepo(root);
+    if (!repo && !candidate.key) {
+      die(
+        `plans/${oldFile} names an issue without a closing key, but gh could not resolve the origin repo.\n` +
+          `Check GitHub, then ship again with --closes or --related.`,
+      );
+    } else if (!repo) {
+      warn(`could not resolve the GitHub repo for origin; skipped the issue label flip.`);
+    } else {
+      const ref = issueRef(candidate.raw, repo);
+      if (ref.num && candidate.key) {
+        if (chosen && chosen !== candidate.key) {
+          die(
+            `the front matter already says ${candidate.key}: "${candidate.raw}", and --${opts.closes ? 'closes' : 'related'} says the opposite.\n` +
+              `Edit the key in plans/${oldFile}, then ship with no flag.`,
+          );
+        }
+        issueFlip = { repo, num: ref.num, key: candidate.key };
+      } else if (ref.num && !chosen) {
+        die(chooseKeyMessage(root, repo, ref.num, oldFile, issueSummary(root, repo, ref.num)));
+      } else if (ref.num) {
+        const withKey = addIssueKey(body, ref.num, chosen);
+        if (!withKey.added) {
+          die(
+            `plans/${oldFile} has no valid front matter for ${chosen}: "${ref.num}".\n` +
+              `Add the front matter, then ship again.`,
+          );
+        }
+        body = withKey.text;
+        issueKeyAdded = { num: ref.num, key: chosen };
+        issueFlip = { repo, num: ref.num, key: chosen };
+      } else if (ref.reason === 'outside') {
+        warn(`${candidate.source} points outside ${repo} (or at a pull request): '${candidate.raw}'. Ignored — never flip an issue by a number lifted from another repo.`);
+      } else {
+        warn(`could not read an issue number from ${candidate.source}: '${candidate.raw}'. Skipped the label flip.`);
+      }
+    }
+  }
 
   // Reuse the row the author already wrote locally (it matches this repo's README format);
   // synthesize one only if it is missing.
@@ -281,6 +722,7 @@ function cmdShip(fileArg) {
 
   let shipped = null;
   let renumbered = false;
+  let frontMatterCorrected = null;
 
   for (let attempt = 1; attempt <= 3 && !shipped; attempt++) {
     fetch(root);
@@ -305,10 +747,15 @@ function cmdShip(fileArg) {
 
     try {
       fs.mkdirSync(path.join(wt, 'plans'), { recursive: true });
-      fs.writeFileSync(
-        path.join(wt, 'plans', newFile),
+      // renumberText rewrites what a reader sees (filename refs, links, the `# Plan NNN`
+      // heading); reconcilePlanNumber rewrites what `pnpm plans:index` reads. Both, always —
+      // shipping one without the other is how a plan becomes invisible to the executor.
+      const reconciled = reconcilePlanNumber(
         num === oldNum ? body : renumberText(body, oldNum, num, slug),
+        num,
       );
+      frontMatterCorrected = reconciled.corrected;
+      fs.writeFileSync(path.join(wt, 'plans', newFile), reconciled.text);
 
       const readmePath = path.join(wt, 'plans', 'README.md');
       const base = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, 'utf8') : '# Plans\n';
@@ -353,23 +800,58 @@ function cmdShip(fileArg) {
         `after this plan was written.\n`,
     );
   }
+  if (frontMatterCorrected) {
+    // Reported, never silent: this field is what the index reads, and a quiet correction here
+    // is exactly how the 423/428 mismatch went unnoticed until the index lost a row.
+    process.stdout.write(
+      `corrected front matter: plan: "${frontMatterCorrected}" -> "${shipped.num}" ` +
+        `(the field 'pnpm plans:index' reads).\n`,
+    );
+  }
   process.stdout.write(
     `shipped plans/${shipped.newFile} to origin/${main} (${shipped.sha}).\n` +
       `local copy removed; run 'git pull' to get the landed version.\n`,
   );
+  if (issueKeyAdded) {
+    process.stdout.write(
+      `front matter: added ${issueKeyAdded.key}: "${issueKeyAdded.num}" ` +
+        (issueKeyAdded.key === 'closes_issue'
+          ? `. The executor will write 'Closes #${issueKeyAdded.num}' into the PR, so the merge closes it.\n`
+          : `(related, no closing keyword). #${issueKeyAdded.num} stays open after the fix merges.\n`),
+    );
+  }
+  if (issueFlip) {
+    flipIssueLabels(root, { ...issueFlip, main, planNum: shipped.num, planFile: shipped.newFile });
+  }
+  if (researchWarned) {
+    process.stderr.write(
+      `  ⚠  ...and it shipped with NO research (${researchVerdict}). Say so when you report this plan.\n`,
+    );
+  }
 }
 
-const [cmd, arg] = process.argv.slice(2);
+const [cmd, arg, ...flags] = process.argv.slice(2);
+const knownFlags = new Set(['--closes', '--related']);
+if (cmd === 'ship') {
+  const unknown = flags.find((flag) => !knownFlags.has(flag));
+  if (unknown) die(`unknown ship option: ${unknown}`);
+}
 switch (cmd) {
   case 'next': cmdNext(); break;
   case 'ghosts': cmdGhosts(); break;
-  case 'ship': cmdShip(arg); break;
+  case 'ship': cmdShip(arg, { closes: flags.includes('--closes'), related: flags.includes('--related') }); break;
+  case 'research': cmdResearch(arg); break;
+  case 'issue': cmdIssue(arg); break;
   default:
     process.stderr.write(
-      'usage: plan-number <next|ghosts|ship <file>>\n' +
-        '  next          next free plan number (origin + all refs + untracked local)\n' +
-        '  ghosts        untracked local plans that already landed upstream\n' +
-        '  ship <file>   renumber-if-taken, then commit+push the plan and its README row\n',
+      'usage: plan-number <next|ghosts|research <file>|issue <file>|ship <file>>\n' +
+        '  next            next free plan number (origin + all refs + untracked local)\n' +
+        '  ghosts          untracked local plans that already landed upstream\n' +
+        '  research <file> classify the plan\'s ## Research section (warn-only, never blocks)\n' +
+        '  issue <file>    dry run of the issue label flip: which issue, which key, what ship will do\n' +
+        '  ship <file> [--closes|--related]\n' +
+        '                  require an issue relationship, then commit+push the plan and README row;\n' +
+        '                  then mark the issue planned (+planned, -needs-triage, comment)\n',
     );
     process.exit(cmd ? 1 : 0);
 }

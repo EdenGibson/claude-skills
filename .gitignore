@@ -14,3 +14,9 @@ venv/
 # Logs and transient state
 *.log
 .cache/
+
+# Local-only state, not skills
+.backups/
+.claude/
+synced/
+*.mp4

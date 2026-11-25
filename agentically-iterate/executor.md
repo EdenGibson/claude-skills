@@ -1,12 +1,16 @@
 Apply review findings to the work described in {RUN}/cold/brief.md.
 Findings: the Blocking sections of {RUN}/history/review-{N}-a.md and
-{RUN}/history/review-{N}-b.md. A finding both reviews raise is one finding.
+{RUN}/history/review-{N}-b.md, plus every numbered finding in
+{RUN}/history/exec-{N}-input.md when that file exists. Treat each finding in
+that file as blocking. A finding both reviews raise is one finding.
 Earlier rounds: {RUN}/history/ledger.md.
 
-Skip every finding on an item under the brief's "## Dropped items". Never
-edit the files of an item under "## Frozen items" or "## Dropped items". A
-finding on a frozen item that a scripted check shows may be fixed in shared
-code only.
+Skip every finding on an item under "## Dropped items" in
+{RUN}/history/items.md, when that file exists. An item that either review
+fails is never under "## Frozen items", so fix it as any other finding.
+Edit a file of an item under "## Frozen items" or "## Dropped items" there
+only when a finding's fix needs that file, such as a file two items share.
+Keep the output of each such item the same as before your edit.
 
 For each other blocking finding:
 1. Check the problem it names against the work first. If the problem holds,

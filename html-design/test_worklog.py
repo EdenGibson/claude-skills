@@ -6,6 +6,7 @@ Exits 0 on success, non-zero (with a FAIL line) otherwise.
 
 Port 4398, chosen so this suite and test_server.py (4399) can run at once.
 """
+import gzip
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(HERE, "server.py")
@@ -726,6 +728,286 @@ def test_chart_over_http_reaches_the_browser():
         check("Served chart" in body and "<svg" in body,
               "the chart reaches the browser as inline SVG")
         check("log body" in body, "the log still reaches the browser")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+# --- Opening a long page: lazy, sized, compressed, cached -----------------
+#
+# The design-qa-sep task is what forced these: 184 entries, a megabyte of
+# markup and 103 screenshots totalling 10.4 MB, every one of them fetched
+# eagerly at open, on a page that reloads after every append.
+
+
+def _png_bytes(width, height):
+    """A real, decodable PNG. Header parsing must be tested against one."""
+    def chunk(kind, payload):
+        return (len(payload).to_bytes(4, "big") + kind + payload
+                + zlib.crc32(kind + payload).to_bytes(4, "big"))
+    ihdr = (width.to_bytes(4, "big") + height.to_bytes(4, "big")
+            + bytes([8, 0, 0, 0, 0]))            # 8-bit greyscale
+    raw = b"".join(b"\x00" + b"\x80" * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def _gif_bytes(width, height):
+    return (b"GIF89a" + width.to_bytes(2, "little")
+            + height.to_bytes(2, "little") + b"\x00\x00\x00" + b";")
+
+
+def _jpeg_bytes(width, height):
+    app0 = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\x00\x01\x01\x00" + b"\x00" * 7
+    sof0 = (b"\xff\xc0" + (11).to_bytes(2, "big") + b"\x08"
+            + height.to_bytes(2, "big") + width.to_bytes(2, "big") + b"\x01\x01\x11\x00")
+    return b"\xff\xd8" + app0 + sof0 + b"\xff\xd9"
+
+
+def _webp_bytes(width, height):
+    body = (b"WEBP" + b"VP8X" + (10).to_bytes(4, "little") + b"\x00" * 4
+            + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little"))
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+def test_image_size_reads_every_format_we_serve():
+    mod = load_server_module()
+    root = tempfile.mkdtemp(prefix="wl-imgsize-")
+    cases = [("a.png", _png_bytes(37, 11), (37, 11)),
+             ("b.gif", _gif_bytes(64, 48), (64, 48)),
+             ("c.jpg", _jpeg_bytes(120, 90), (120, 90)),
+             ("d.webp", _webp_bytes(200, 150), (200, 150))]
+    for name, blob, want in cases:
+        p = os.path.join(root, name)
+        with open(p, "wb") as f:
+            f.write(blob)
+        check(mod.image_size(p) == want,
+              f"{name} reads {want} (got {mod.image_size(p)})")
+    junk = os.path.join(root, "e.png")
+    with open(junk, "wb") as f:
+        f.write(b"not an image at all")
+    check(mod.image_size(junk) is None, "a file that is not an image reads None")
+    check(mod.image_size(os.path.join(root, "gone.png")) is None,
+          "a missing file reads None")
+    # The cache is keyed on mtime and size, so a rewritten file re-reads.
+    p = os.path.join(root, "a.png")
+    check(mod.image_size(p) == (37, 11), "cached read returns the same size")
+    with open(p, "wb") as f:
+        f.write(_png_bytes(5, 9))
+    os.utime(p, (0, 0))
+    check(mod.image_size(p) == (5, 9), "a rewritten image is measured again")
+
+
+def test_worklog_images_are_lazy_and_sized():
+    mod = load_server_module()
+    root = tempfile.mkdtemp(prefix="wl-lazy-")
+    d = make_task(root, "shots", log=(
+        '<img src="assets/one.png" alt="one">'
+        '<img src="assets/sub/two.png" style="max-width:100%">'
+        '<img src="assets/one.png" loading="eager" alt="kept">'
+        '<img src="assets/one.png" width="10" alt="already sized">'
+        '<img src="https://example.com/x.png" alt="remote">'
+        '<img src="assets/missing.png" alt="not on disk">'
+    ))
+    os.makedirs(os.path.join(d, "assets", "sub"), exist_ok=True)
+    with open(os.path.join(d, "assets", "one.png"), "wb") as f:
+        f.write(_png_bytes(400, 250))
+    with open(os.path.join(d, "assets", "sub", "two.png"), "wb") as f:
+        f.write(_png_bytes(60, 20))
+
+    page = mod.worklog_page(root, "shots")
+    tags = re.findall(r"<img[^>]*>", page)
+    check(len(tags) == 6, f"all six images survive the rewrite (got {len(tags)})")
+    by_alt = {re.search(r'alt="([^"]*)"', t).group(1): t
+              for t in tags if 'alt="' in t}
+
+    check('loading="lazy"' in by_alt["one"] and 'decoding="async"' in by_alt["one"],
+          "a plain image becomes lazy and async-decoded")
+    check('width="400" height="250"' in by_alt["one"],
+          "a plain image is sized from the file on disk")
+    check('alt="one"' in by_alt["one"] and 'src="assets/one.png"' in by_alt["one"],
+          "the original attributes are left intact")
+
+    two = next(t for t in tags if "two.png" in t)
+    check('width="60" height="20"' in two, "an image in a subfolder is sized too")
+    check('style="max-width:100%"' in two, "an inline style survives")
+
+    check('loading="eager"' in by_alt["kept"] and 'loading="lazy"' not in by_alt["kept"],
+          "an explicit loading= is never overridden")
+    check('height="250"' not in by_alt["already sized"],
+          "an image that sets its own width is not re-sized")
+    check('loading="lazy"' in by_alt["remote"] and "width=" not in by_alt["remote"],
+          "a remote image goes lazy but is not measured")
+    check('loading="lazy"' in by_alt["not on disk"] and "width=" not in by_alt["not on disk"],
+          "an image with no file on disk goes lazy but is not measured")
+
+
+def test_worklog_images_cannot_be_measured_outside_the_task():
+    """The src is attacker-shaped input: it comes from a fragment on disk."""
+    mod = load_server_module()
+    base, root = make_escape_root("wl-imgesc-")
+    with open(os.path.join(base, "outside.png"), "wb") as f:
+        f.write(_png_bytes(999, 777))
+    make_task(root, "t", log='<img src="../../outside.png" alt="escape">')
+    page = mod.worklog_page(root, "t")
+    check('width="999"' not in page and 'height="777"' not in page,
+          "a traversing src is never opened for its dimensions")
+    check('loading="lazy"' in page, "it still gets the lazy attribute")
+
+
+def test_worklog_page_is_gzipped_for_clients_that_ask():
+    mod = load_server_module()
+    root = tempfile.mkdtemp(prefix="wl-gzip-")
+    # Comfortably over _GZIP_MIN, and repetitive, like a real log.
+    make_task(root, "big", log="<p>a repeated line of log text</p>" * 400)
+    proc = start_server(root)
+    try:
+        check(wait_until_up(), "server starts for the gzip check")
+        req = urllib.request.Request(BASE + "/big/",
+                                     headers={"Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            enc = r.headers.get("Content-Encoding")
+            vary = r.headers.get("Vary", "")
+            raw = r.read()
+        check(enc == "gzip", f"a gzip-capable client gets gzip (got {enc!r})")
+        check("Accept-Encoding" in vary, "the response varies on Accept-Encoding")
+        body = gzip.decompress(raw).decode("utf-8")
+        check("repeated line of log text" in body, "the gzipped body is the page")
+        check(len(raw) < len(body) / 2,
+              f"it actually compresses ({len(raw)} vs {len(body)} bytes)")
+
+        plain = urllib.request.Request(BASE + "/big/",
+                                       headers={"Accept-Encoding": "identity"})
+        with urllib.request.urlopen(plain, timeout=5) as r:
+            check(r.headers.get("Content-Encoding") is None,
+                  "a client that asks for identity gets plain bytes")
+            check("repeated line of log text" in r.read().decode("utf-8"),
+                  "the plain body is the same page")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_worklog_signature_watches_assets_without_stating_each_one():
+    mod = load_server_module()
+    root = tempfile.mkdtemp(prefix="wl-sig-")
+    d = make_task(root, "t")
+    assets = os.path.join(d, "assets")
+    for i in range(60):
+        with open(os.path.join(assets, f"s{i}.png"), "wb") as f:
+            f.write(_png_bytes(4, 4))
+    sig = mod.worklog_signature(root, slug="t")
+    check(len(sig) < 12,
+          f"60 assets do not become 60 signature entries (got {len(sig)})")
+
+    before = mod.worklog_signature(root, slug="t")
+    with open(os.path.join(assets, "new.png"), "wb") as f:
+        f.write(_png_bytes(4, 4))
+    check(mod.worklog_signature(root, slug="t") != before,
+          "a new asset still changes the signature")
+
+    before = mod.worklog_signature(root, slug="t")
+    with open(os.path.join(d, "log.html"), "a", encoding="utf-8") as f:
+        f.write('<section class="wl-entry" data-ts="x">more</section>\n')
+    check(mod.worklog_signature(root, slug="t") != before,
+          "an append changes the signature")
+
+    before = mod.worklog_signature(root, slug="t")
+    charts = os.path.join(d, "charts")
+    os.makedirs(charts, exist_ok=True)
+    with open(os.path.join(charts, "f1.json"), "w", encoding="utf-8") as f:
+        f.write('{"id":"f1"}')
+    check(mod.worklog_signature(root, slug="t") != before,
+          "a new chart changes the signature")
+
+    before = mod.worklog_signature(root, slug="t")
+    with open(os.path.join(charts, "f1.json"), "w", encoding="utf-8") as f:
+        f.write('{"id":"f1","title":"changed"}')
+    check(mod.worklog_signature(root, slug="t") != before,
+          "an edited chart changes the signature, so charts stay per-file")
+
+
+def test_worklog_document_cache_rebuilds_on_every_append():
+    mod = load_server_module()
+    root = tempfile.mkdtemp(prefix="wl-doccache-")
+    d = make_task(root, "t", log="<p>first</p>")
+    first = mod.worklog_document(root, "t")
+    check(b"first" in first, "the document holds the log")
+    check(mod.worklog_document(root, "t") is first,
+          "an unchanged task serves the cached bytes")
+    with open(os.path.join(d, "log.html"), "a", encoding="utf-8") as f:
+        f.write('<section class="wl-entry" data-ts="y"><p>second</p></section>\n')
+    second = mod.worklog_document(root, "t")
+    check(b"second" in second, "an append is visible on the very next request")
+    check(mod.worklog_document(root, "nope") is None,
+          "an unknown slug is still None, not a cached page")
+
+
+def test_keepalive_serves_a_second_request_on_one_connection():
+    """A page with a hundred screenshots paid a hundred TCP handshakes."""
+    root = tempfile.mkdtemp(prefix="wl-keepalive-")
+    d = make_task(root, "t", log='<img src="assets/a.png">')
+    with open(os.path.join(d, "assets", "a.png"), "wb") as f:
+        f.write(_png_bytes(8, 8))
+    proc = start_server(root)
+    try:
+        check(wait_until_up(), "server starts for the keep-alive check")
+        s = socket.create_connection(("127.0.0.1", PORT), timeout=8)
+        try:
+            got = []
+            for path in ("/t/", "/t/assets/a.png"):
+                s.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                          f"Accept-Encoding: identity\r\n\r\n".encode())
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    part = s.recv(65536)
+                    if not part:
+                        break
+                    head += part
+                status = head.split(b"\r\n", 1)[0]
+                m = re.search(rb"Content-Length: (\d+)", head, re.I)
+                body = head.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in head else b""
+                need = int(m.group(1)) if m else 0
+                while len(body) < need:
+                    part = s.recv(65536)
+                    if not part:
+                        break
+                    body += part
+                got.append((status, len(body), need))
+            check(all(g[0].startswith(b"HTTP/1.1 200") for g in got),
+                  f"both requests answered on one connection ({got})")
+            check(all(g[1] == g[2] for g in got),
+                  f"each body matches its Content-Length ({got})")
+        finally:
+            s.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_slug_redirect_declares_a_length():
+    """301 with no body and no length hangs a kept-alive connection."""
+    root = tempfile.mkdtemp(prefix="wl-301-")
+    make_task(root, "t")
+    proc = start_server(root)
+    try:
+        check(wait_until_up(), "server starts for the redirect check")
+        s = socket.create_connection(("127.0.0.1", PORT), timeout=8)
+        try:
+            s.sendall(b"GET /t HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            head = b""
+            deadline = time.time() + 5
+            while b"\r\n\r\n" not in head and time.time() < deadline:
+                part = s.recv(4096)
+                if not part:
+                    break
+                head += part
+            check(head.split(b"\r\n", 1)[0].startswith(b"HTTP/1.1 301"),
+                  "a slug with no trailing slash still redirects")
+            check(re.search(rb"Content-Length: 0", head, re.I) is not None,
+                  "the redirect declares Content-Length: 0")
+        finally:
+            s.close()
     finally:
         proc.terminate()
         proc.wait(timeout=5)

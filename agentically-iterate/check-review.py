@@ -6,6 +6,8 @@ Usage: check-review.py REVIEW BRIEF
 A valid review prints PASS or FAIL, then one ITEM line per item in the
 brief's "## Items" section, and exits 0. Any other shape prints
 "LOST: <reason>" and exits 1. A lost review never counts as a verdict.
+A PASS may mark a criterion "Unverified." only when the brief tags that
+criterion "(unverified)".
 """
 import re
 import sys
@@ -60,9 +62,27 @@ def item_name(text):
     return text.strip().strip("`").strip()
 
 
-def brief_items(path):
+def brief_sections(path):
     with open(path) as f:
-        secs = sections(f.read().splitlines())
+        return sections(f.read().splitlines())
+
+
+def number(entry):
+    m = re.match(r"^\s*(\d+)\.", entry)
+    return int(m.group(1)) if m else None
+
+
+def brief_unverified(path):
+    """Numbers of the brief's criteria tagged (unverified)."""
+    return {
+        number(c)
+        for c in entries(brief_sections(path).get("criteria", []))
+        if "(unverified)" in c.lower()
+    }
+
+
+def brief_items(path):
+    secs = brief_sections(path)
     names = []
     for line in secs.get("items", []):
         m = re.match(r"^\s*-\s+(.+?)\s*$", line)
@@ -101,6 +121,7 @@ def main():
     # A FAIL stands on its Blocking section, so only a PASS needs every
     # criterion to carry a plain status.
     if passed:
+        tagged = brief_unverified(brief)
         for c in crit:
             said = [m.group(1) for m in STATUS.finditer(c)]
             said += [m.group(1) for m in HEDGED.finditer(c)]
@@ -108,6 +129,8 @@ def main():
                 lost(f"PASS with a criterion at Not met: {c[:80]!r}")
             if not STATUS.search(c):
                 lost(f"PASS with a hedged or missing status: {c[:80]!r}")
+            if "Unverified" in said and number(c) not in tagged:
+                lost(f"PASS with Unverified on a criterion the brief does not tag (unverified): {c[:80]!r}")
 
     blocking = body(secs["blocking"])
     if passed and blocking != ["None."]:

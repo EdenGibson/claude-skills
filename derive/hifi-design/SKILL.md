@@ -1,6 +1,6 @@
 ---
 name: hifi-design
-description: Use when taking a Derive UI to high fidelity in the real React app instead of throwaway HTML — promoting an html-design mockup (e.g. current.html) to the real shipping component, or iterating on a real Derive component's look live on the laptop with all four themes. WYSIWYG, nothing to translate. Derive-only.
+description: Use when taking a Derive UI to high fidelity in the real React app instead of throwaway HTML — promoting an html-design mockup (e.g. pricing-dark.html) to the real shipping component, or iterating on a real Derive component's look live on the laptop with all four themes. WYSIWYG, nothing to translate. Derive-only.
 ---
 
 # hifi-design — high-fidelity React design loop
@@ -41,7 +41,7 @@ reinterpretation.
    first run/restart: `http://devbox:<port>/scratch`.
 
 3. **Iterate in `Scratch.tsx`:**
-   - *Given a mockup* (e.g. `~/design-lab/current.html`) → transcribe it into real tokens /
+   - *Given a mockup* (e.g. `~/design-lab/pricing-dark.html`) → transcribe it into real tokens /
      components / Phosphor. Start from the token-native `derive-base.html` vocabulary.
    - *Fresh* → build directly in React.
    - Each save → Fast Refresh → the laptop updates.

@@ -1,5 +1,16 @@
 # Handoff Plan Template
 
+> **Before you change this file.** It was forked from `improve`'s template on 2026-07-31 so edits
+> here don't silently alter every plan `improve` writes. **The executor-facing contract must stay in
+> sync between the two**: the `> Executor instructions` + drift-check block, the `## Status` field set
+> (`plan-executor` orders work by Priority/Effort/Depends-on), the `proof:*` tags on Done criteria,
+> the `evidence: motion` marker, and the `plans/README.md` row format. Diff against
+> `~/.claude/skills/improve/references/plan-template.md` before changing any of those; everything else
+> is this skill's to tune. (`## Research` lives only here. `## Design constraints` was mirrored into
+> `improve`'s template on 2026-08-01; it is *not* executor contract today — nothing in
+> `plan-exec-tick.sh` parses it — so if a design-lint gate ever keys off the heading, both templates
+> must then move together.)
+
 Every plan is written for an executor model that has **zero context**: it has not seen the advisor session, the audit, the other plans, or any prior conversation. It may be a smaller/cheaper model. Assume it is competent at following explicit instructions and weak at filling gaps, recovering from ambiguity, or knowing when to stop.
 
 Three properties make a plan executable by a weaker model:
@@ -15,14 +26,24 @@ File naming: `plans/NNN-short-slug.md`, numbered in recommended execution order.
 ## Template
 
 ```markdown
+---
+plan: "NNN"
+title: "<same title as the heading below, minus the `Plan NNN:` prefix>"
+priority: "P1"
+effort: "S"
+depends_on: "none"
+issue: "<NNNN — only when this plan comes from a GitHub issue in THIS repo; write closes_issue: instead when the plan FULLY resolves it; delete this line otherwise>"
+---
+
 # Plan NNN: <Imperative title — what will be true after this plan>
 
 > **Executor instructions**: Follow this plan step by step. Run every
 > verification command and confirm the expected result before moving to the
 > next step. If anything in the "STOP conditions" section occurs, stop and
-> report — do not improvise. When done, update the status row for this plan
-> in `plans/README.md` — unless a reviewer dispatched you and told you they
-> maintain the index.
+> report — do not improvise. When done, update the `## Status` section at the
+> top of THIS file. **Do not edit `plans/README.md`** — it is generated from
+> each plan's front matter, and a CI check (`not-edited-on-branch`) fails any
+> PR that touches it.
 >
 > **Drift check (run first)**: `git diff --stat <planned-at SHA>..HEAD -- <in-scope paths>`
 > If any in-scope file changed since this plan was written, compare the
@@ -37,7 +58,26 @@ File naming: `plans/NNN-short-slug.md`, numbered in recommended execution order.
 - **Depends on**: plans/NNN-*.md (or "none")
 - **Category**: bug | security | perf | tests | tech-debt | migration | dx | docs | direction
 - **Planned at**: commit `<short SHA>`, <YYYY-MM-DD>
-- **Issue**: <GitHub issue URL — only when published via `--issues`; omit otherwise>
+- **Issue**: <GitHub issue URL in this repo — when the plan comes from an issue, or when published via `--issues`; omit otherwise>
+- **State**: TODO — <one line: when authored, against which SHA, and why>
+
+**The YAML front matter and the `- **State**:` bullet are both REQUIRED** — they
+are what `pnpm plans:index` reads to generate `plans/README.md`. A plan missing
+either does not merely lose its row: the generator **throws** and refuses to
+regenerate the index at all, so it breaks the ledger for every other plan too.
+`- **State**:` is the only bullet that reaches the index's Status column; the
+rest of this section is for humans. Keep it to one line (it becomes a table cell).
+
+**Issue keys.** `closes_issue: "N"` means this plan fully resolves issue N: the
+executor puts `Closes #N` in the PR body and GitHub closes the issue when the PR
+merges. `issue: "N"` means related only: prose citation, no keyword, the issue
+stays open after the fix merges. At most one key, same repo only, never a PR
+number or an upstream URL, and `issue:` whenever you are unsure — a wrong
+`issue:` leaves a report open (recoverable); a wrong `closes_issue:` closes a
+live report on the person who filed it (not). `plan-number ship` reads whichever
+key is present (falling back to the `- **Issue**:` bullet and writing `issue:`
+in), then adds `planned`, removes `needs-triage`, and comments
+`<!-- plan: NNN -->` on the issue. The index generator ignores both keys.
 
 ## Why this matters
 
@@ -59,17 +99,57 @@ The facts the executor needs, inlined — never "as discussed" or "see audit":
 
 ## Research
 
-**Required — never omit this section.** Exactly one of:
+**Required — never omit this section.** Built from sources you actually opened, not from memory —
+by the research dispatch (`~/.claude/skills/write-plan/references/research-dispatch.md`, the fastest
+route) or by searching directly. Exactly one of:
 
 - **≥1 citation.** Each external fact this plan rests on (library/API behavior, version
   constraint, security advisory, best-practice choice, verbatim error string) with the URL and
   the date/version checked. Prefer primary sources — official docs *for the version in use*,
   release notes, the actual issue/PR/commit, advisories — over blog summaries, and cross-check
-  two where the fact decides the approach. Name the reference implementation you modelled, if any.
-- **The literal line** `No external surface — <reason>` when the change is purely internal logic
-  with no library/API/version/security/best-practice/error-message angle.
+  two where the fact decides the approach. Name the reference implementation you modelled — an external URL, or an in-repo `file:line` when
+  this codebase already contains the best exemplar — or "none found".
+  Format each as: `- <fact the executor can act on> — <URL> (checked YYYY-MM-DD, <pkg>@<version>)`.
+  Close with `**Approach verdict**: CURRENT | SUPERSEDED | DEPRECATED | INSECURE — <one line + URL>`.
+- **The literal line** `No external surface — <reason>` where the reason names what you checked and
+  found absent ("no library, API, version, security, best-practice or error-string angle"), not
+  merely that the code is internal. "It's an internal refactor" restates the change; it is not a
+  reason.
 
-An empty or missing section means the research step was skipped, not that none was needed.
+An empty or missing section means the research step was skipped, not that none was needed —
+a source you actually opened beats recollection roughly 9 times out of 10, and the executor has no
+way to catch what you misremembered. Never cite a URL you did not open; a plausible link you
+inferred is worse than no citation, because it reads as verified.
+
+Checkable: `plan-number research plans/NNN-slug.md` must print `cited` or `declared`, and must not
+add `(no Approach verdict)` — citing sources proves you looked; the verdict is what checks the
+decision you are handing to a zero-context executor.
+
+## Design constraints
+
+**Required whenever the change is user-visible** — any new/changed component, stylesheet,
+layout, colour, spacing, typography, icon, motion, or copy shown in the product. Exactly one of:
+
+- **The constraints, inlined**, so the executor never has to *choose* a visual value:
+  - **Where the design system lives** — the doc path(s) that govern this surface and the one
+    rule each imposes, quoted: "`docs/design/surface-elevation.md` — panels use
+    `--surface-raised`, never a bespoke shadow."
+  - **The exact tokens to use**, by name, with the file they're defined in: "`--color-accent`,
+    `--space-3`, `--radius-md` (defined in `app/globals.css` `:root`)." Never "the accent
+    colour" — name the variable. If no token exists for something the change needs, say so
+    explicitly and state which STOP condition that triggers.
+  - **The exemplar to mirror** — one existing component that already does this correctly, with
+    `file:line`: "match the panel chrome in `components/canvas/RegionSidePanel.module.css:1-40`."
+  - **The non-negotiables that apply here**, from the repo's own list (e.g. tokens before
+    values / themed in every theme / `prefers-reduced-motion` respected / icons from the
+    project icon set only). List only the ones this change can violate, not the whole charter.
+- **The literal line** `No visual surface — <reason>` when nothing a user sees changes
+  (pure logic, build config, tests, server-side).
+
+A plan that touches a stylesheet or component and names no tokens is not self-contained: the
+executor will invent a value, and an invented value is how hard-coded hex enters the codebase.
+If the repo has **no** design system, write `No design system found — <what you checked>` and
+name the closest existing component the executor should imitate instead.
 
 ## Commands you will need
 
@@ -157,7 +237,15 @@ plan operator-only and say so in Status. (Measured: this stalled plan 283 at a m
 - [ ] <the specific user-visible behavior this plan changes, stated as one assertion> · proof:behavior
 - [ ] `grep -rn "<old pattern>" src/` returns no matches · proof:cmd
 - [ ] No files outside the in-scope list are modified (`git status`) · proof:cmd
-- [ ] `plans/README.md` status row updated · proof:cmd
+- [ ] This plan's own `## Status` section updated; `plans/README.md` NOT modified (it is generated — `git status` shows it clean) · proof:cmd
+
+**When `## Design constraints` is non-empty, at least one criterion must bind it** — a promise
+nothing checks is the failure mode this section exists to close. Prefer the mechanical form:
+
+- [ ] No hard-coded colour added: `git diff --merge-base origin/main -- '*.module.css' | grep -E '^\+.*#[0-9a-fA-F]{3}'` returns no matches · proof:cmd
+- [ ] Every icon added comes from the project icon set — no inline `<svg>` in the diff · proof:cmd
+- [ ] <the surface> renders correctly in each supported theme · proof:ui
+- [ ] New `transition`/`animation` declarations sit under a `prefers-reduced-motion` guard · proof:cmd
 
 ## STOP conditions
 
@@ -219,3 +307,4 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 - Would a reviewer reading only "Why this matters" + "Done criteria" understand what they're approving?
 - No secret values anywhere in the file — locations and credential types only.
 - "Planned at" SHA is filled in and the in-scope paths in the drift check match the Scope section.
+- Does the plan touch a component, stylesheet, icon, or motion? Then `## Design constraints` names **exact token variables**, an exemplar `file:line` to mirror, and the applicable non-negotiables — and one Done criterion binds them. "Use the accent colour" is a gap, not a constraint.
